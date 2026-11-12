@@ -112,7 +112,15 @@
     }
   },
   "google_drive": {
-    "status": "pending"
+    "status": "complete_verified",
+    "id": "14q4KEkgUb4kM-S0b2oiVC9dvC_JQ0BRQ",
+    "web_view_link": "https://drive.google.com/file/d/14q4KEkgUb4kM-S0b2oiVC9dvC_JQ0BRQ/view?usp=drivesdk",
+    "size": 7124579448,
+    "md5": "056178dcdad02f106fc5f4274f34733e",
+    "sha256": "0edbbf231a129c32aedd28ded94f3afa4b8c5988fa6538a7a339383c8036e46a",
+    "public_link_readable": true,
+    "verified_at": "2026-11-13T04:33:23+08:00",
+    "transfer_verification_url": "https://github.com/ziyi612/sanmou-utility-plugins/actions/runs/43300590849"
   },
   "restore": {
     "tool": "tools/restore_battle_database.py",

@@ -6,6 +6,8 @@
 
 ## 下载和核对
 
+本批次可选择 [Google Drive 完整单文件](https://drive.google.com/file/d/14q4KEkgUb4kM-S0b2oiVC9dvC_JQ0BRQ/view?usp=drivesdk)，或下载 [GitHub Release 的全部 7 个分卷](https://github.com/ziyi612/sanmou-utility-plugins/releases/tag/data-20261113)。两处对应同一份归档；Google Drive 返回的完整文件大小、MD5 和 SHA-256 已与本地验证结果核对一致。
+
 下载入口、实际压缩大小、SHA-256、原始 DB/WAL 校验值及生成时间记录在 `data/releases/` 的发布清单中。Google Drive 提供完整单文件，GitHub Release 提供不超过 1 GiB 的分卷。
 
 从 GitHub 下载时，将同一批次的所有 `.part001` 等分卷放入 `downloads`，再用清单逐片验证并合并：

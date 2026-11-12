@@ -4,6 +4,8 @@
 
 本仓库是可移植的软件副本，不包含使用者的数据库、采集缓存、账号配置或运行日志。大型战报库通过独立归档提供；[下载清单、校验值和恢复工具](docs/database-archive.md)随数据归档发布，数据库恢复到 `data/database/battle_reports.db` 后即可查阅。软件也可以创建自己的新数据库。
 
+2026-11-13 完整数据库： [Google Drive 单文件（7.12 GB）](https://drive.google.com/file/d/14q4KEkgUb4kM-S0b2oiVC9dvC_JQ0BRQ/view?usp=drivesdk) · [GitHub Release 分卷](https://github.com/ziyi612/sanmou-utility-plugins/releases/tag/data-20261113) · [逐文件校验清单](data/releases/2026-11-13.json)。原 DB 与 WAL 合计约 114.21 GB；恢复前请阅读[空间需求及步骤](docs/database-archive.md)。
+
 ## 安装
 
 使用 Windows 和 Python 3.10 或更新版本。官方 Windows Python 通常包含 Tkinter；实时采集另需 `frida`、`psutil`，Excel 导出使用 `openpyxl`，不需要 Node 或任何私人运行环境。
