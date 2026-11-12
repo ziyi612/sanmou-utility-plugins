@@ -1,0 +1,124 @@
+{
+  "format": "sanmou-database-release-v1",
+  "snapshot_date": "2026-11-13",
+  "created_at": "2026-11-13T03:03:22.962780+08:00",
+  "repository": "ziyi612/sanmou-utility-plugins",
+  "release_url": "https://github.com/ziyi612/sanmou-utility-plugins/releases/tag/data-20261113",
+  "archive": {
+    "name": "battle_reports_20261113.tar.zst",
+    "size": 7124579448,
+    "sha256": "0edbbf231a129c32aedd28ded94f3afa4b8c5988fa6538a7a339383c8036e46a",
+    "md5": "056178dcdad02f106fc5f4274f34733e"
+  },
+  "parts": [
+    {
+      "index": 1,
+      "name": "battle_reports_20261113.tar.zst.part001",
+      "size": 1073741824,
+      "sha256": "d2cf242970f15c0142a56321ecf3dab47cb35f01b44c03501316a3a7b7173ee8",
+      "md5": "15930262d4085ce6408ae50135e25aa3",
+      "asset_id": 740752064,
+      "download_url": "https://github.com/ziyi612/sanmou-utility-plugins/releases/download/data-20261113/battle_reports_20261113.tar.zst.part001",
+      "server_sha256": "d2cf242970f15c0142a56321ecf3dab47cb35f01b44c03501316a3a7b7173ee8"
+    },
+    {
+      "index": 2,
+      "name": "battle_reports_20261113.tar.zst.part002",
+      "size": 1073741824,
+      "sha256": "63c576aa047a2559e10edd4d9e1f21cdf5f9b37134714262758dfaca647ac689",
+      "md5": "c0467a232052fb81a1eec17ffdb56cd8",
+      "asset_id": 740795427,
+      "download_url": "https://github.com/ziyi612/sanmou-utility-plugins/releases/download/data-20261113/battle_reports_20261113.tar.zst.part002",
+      "server_sha256": "63c576aa047a2559e10edd4d9e1f21cdf5f9b37134714262758dfaca647ac689"
+    },
+    {
+      "index": 3,
+      "name": "battle_reports_20261113.tar.zst.part003",
+      "size": 1073741824,
+      "sha256": "fc2d3dbdd75f90cc9b92c5f13ba576a3231ff69d609ef61357194fa3e990625f",
+      "md5": "36cd026d26e6a579593cfb855a815c42",
+      "asset_id": 740795433,
+      "download_url": "https://github.com/ziyi612/sanmou-utility-plugins/releases/download/data-20261113/battle_reports_20261113.tar.zst.part003",
+      "server_sha256": "fc2d3dbdd75f90cc9b92c5f13ba576a3231ff69d609ef61357194fa3e990625f"
+    },
+    {
+      "index": 4,
+      "name": "battle_reports_20261113.tar.zst.part004",
+      "size": 1073741824,
+      "sha256": "65e7e1fb0ece7cdca24407b8d819e739f562aeae3fe3a5be24902199ea790a82",
+      "md5": "0b9d175e826ba5f0961ceaa1d50f2e0a",
+      "asset_id": 740797359,
+      "download_url": "https://github.com/ziyi612/sanmou-utility-plugins/releases/download/data-20261113/battle_reports_20261113.tar.zst.part004",
+      "server_sha256": "65e7e1fb0ece7cdca24407b8d819e739f562aeae3fe3a5be24902199ea790a82"
+    },
+    {
+      "index": 5,
+      "name": "battle_reports_20261113.tar.zst.part005",
+      "size": 1073741824,
+      "sha256": "83bbe194130df9a7253942ea90fe0ad7a8aea7146628a932ec3856a29335e045",
+      "md5": "f83494cb1ce4b0e5b06f317509c1721f",
+      "asset_id": 740861873,
+      "download_url": "https://github.com/ziyi612/sanmou-utility-plugins/releases/download/data-20261113/battle_reports_20261113.tar.zst.part005",
+      "server_sha256": "83bbe194130df9a7253942ea90fe0ad7a8aea7146628a932ec3856a29335e045"
+    },
+    {
+      "index": 6,
+      "name": "battle_reports_20261113.tar.zst.part006",
+      "size": 1073741824,
+      "sha256": "f499dd182b0b976f64fcf4541ea972a4d4f48cc921b3550d79d0079cd93f63e8",
+      "md5": "88ee714988a18953f7119c328d72844a",
+      "asset_id": 740865031,
+      "download_url": "https://github.com/ziyi612/sanmou-utility-plugins/releases/download/data-20261113/battle_reports_20261113.tar.zst.part006",
+      "server_sha256": "f499dd182b0b976f64fcf4541ea972a4d4f48cc921b3550d79d0079cd93f63e8"
+    },
+    {
+      "index": 7,
+      "name": "battle_reports_20261113.tar.zst.part007",
+      "size": 682128504,
+      "sha256": "27f17063bdbfa316823cd3d082dd8cb94fdc3d777af1e8ccb9e9ba5a644eaf3e",
+      "md5": "1e9924acf4246362568d7bcd5b949a86",
+      "asset_id": 740876822,
+      "download_url": "https://github.com/ziyi612/sanmou-utility-plugins/releases/download/data-20261113/battle_reports_20261113.tar.zst.part007",
+      "server_sha256": "27f17063bdbfa316823cd3d082dd8cb94fdc3d777af1e8ccb9e9ba5a644eaf3e"
+    }
+  ],
+  "uncompressed_bytes": 114213717600,
+  "source_files": [
+    {
+      "name": "battle_reports.db",
+      "size": 113971560448,
+      "sha256": "ea05bc56cb69b8f2e655425143ada6e53c40d1822e87e6d07d0acb7d900ddbb0"
+    },
+    {
+      "name": "battle_reports.db-wal",
+      "size": 242157152,
+      "sha256": "d97c8a981d48424325c23613172d51e225ca1c03dd6f104df233fb2db88a422d"
+    }
+  ],
+  "contents": {
+    "logical_battles": 2213,
+    "saved_snapshots": 18787,
+    "includes_game_nicknames_role_ids_and_history": true
+  },
+  "verification": {
+    "full_stream_decompression_and_source_sha256": true,
+    "compressed_frame_checksum": true,
+    "github_server_part_sha256": true,
+    "source_read_consistency": "DB and WAL write/delete denied together during archive read",
+    "sqlite_quick_check": {
+      "status": "timed_out_incomplete",
+      "limit_seconds": 600,
+      "note": "Timed out without ok or corruption diagnosis; not a completed structure check"
+    }
+  },
+  "google_drive": {
+    "status": "pending"
+  },
+  "restore": {
+    "tool": "tools/restore_battle_database.py",
+    "tool_sha256": "c4977cd4fe4ee6ebbd807c72bf8b70031a78b9ba31f631db0635a251cab2023b",
+    "instructions": "docs/database-archive.md",
+    "requires_db_and_wal_together": true,
+    "free_space_reserve_bytes": 268435456
+  }
+}
