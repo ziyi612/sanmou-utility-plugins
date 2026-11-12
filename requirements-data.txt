@@ -1,2 +1,3 @@
 # Optional tools for checking and restoring a downloaded database archive.
 zstandard>=0.22.0
+requests>=2.32,<3

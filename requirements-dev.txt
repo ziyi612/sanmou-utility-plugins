@@ -1,4 +1,5 @@
 -r requirements.txt
+-r requirements-data.txt
 pytest>=8.0
 lupa>=2.0
 # Optional legacy parser tests:

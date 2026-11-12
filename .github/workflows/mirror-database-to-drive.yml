@@ -1,0 +1,43 @@
+name: Mirror database release to Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: Verified database manifest inside data/releases
+        required: true
+        default: data/releases/2026-11-13.json
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-database-to-drive
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out mirror tool and public manifest
+        # actions/checkout v7.0.1; pinned to the official release commit.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: |
+            tools
+            data/releases
+      - name: Install transfer dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir 'requests>=2.32,<3'
+      - name: Verify release parts and resume the Drive mirror
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+          BATTLE_DRIVE_UPLOAD_URL: ${{ secrets.BATTLE_DRIVE_UPLOAD_URL }}
+        run: >-
+          python3 -B tools/mirror_database_to_drive.py
+          --manifest "$MANIFEST_PATH"
+          --temp-dir "$RUNNER_TEMP"
+          --result "$RUNNER_TEMP/drive-mirror-result.json"

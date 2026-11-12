@@ -6,7 +6,15 @@
 
 ## 下载和核对
 
-下载入口、实际压缩大小、SHA-256、原始 DB/WAL 校验值及生成时间记录在 `data/releases/` 的发布清单中。下载完成后先核对压缩文件 SHA-256；有多个分卷时，必须下载同一版的全部分卷并按清单顺序合并，不要混用不同发布。
+下载入口、实际压缩大小、SHA-256、原始 DB/WAL 校验值及生成时间记录在 `data/releases/` 的发布清单中。Google Drive 提供完整单文件，GitHub Release 提供不超过 1 GiB 的分卷。
+
+从 GitHub 下载时，将同一批次的所有 `.part001` 等分卷放入 `downloads`，再用清单逐片验证并合并：
+
+```powershell
+python -B tools/join_database_parts.py data/releases/2026-11-13.json --parts-dir .\downloads --output .\downloads\battle_reports_20261113.tar.zst
+```
+
+合并需要额外一份压缩归档的空间。脚本保留下载分卷并拒绝覆盖；完成后可自行移除已合并的下载分卷，避免重复占用。不要混用不同批次的文件。如文件系统不支持硬链接，脚本会保留已验证的 `.partial` 文件，可核对 SHA-256 后手动改名。
 
 Windows PowerShell 可使用以下命令计算文件 SHA-256：
 
