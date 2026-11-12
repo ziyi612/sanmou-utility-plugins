@@ -5,3 +5,4 @@ lupa>=2.0
 # Optional legacy parser tests:
 pandas>=2.0
 SQLAlchemy>=2.0
+loguru>=0.7
