@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "id_catalog": "data/dictionaries/id_semantics.json",
+  "event_catalog": "data/dictionaries/event_semantics.json"
+}

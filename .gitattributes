@@ -1,0 +1,9 @@
+* text=auto eol=lf
+# Generated dictionaries reference exact source-byte hashes.
+data/dictionaries/*.json -text
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
+*.zip binary
+*.zst binary
