@@ -30,14 +30,16 @@ jobs:
           sparse-checkout: |
             tools
             data/releases
-      - name: Install transfer dependency
-        run: python3 -m pip install --disable-pip-version-check --no-cache-dir 'requests>=2.32,<3'
+      - name: Create isolated transfer environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/drive-mirror-venv"
+          "$RUNNER_TEMP/drive-mirror-venv/bin/python" -m pip install --disable-pip-version-check --no-cache-dir 'requests>=2.32,<3'
       - name: Verify release parts and resume the Drive mirror
         env:
           MANIFEST_PATH: ${{ inputs.manifest }}
           BATTLE_DRIVE_UPLOAD_URL: ${{ secrets.BATTLE_DRIVE_UPLOAD_URL }}
         run: >-
-          python3 -B tools/mirror_database_to_drive.py
+          "$RUNNER_TEMP/drive-mirror-venv/bin/python" -B tools/mirror_database_to_drive.py
           --manifest "$MANIFEST_PATH"
           --temp-dir "$RUNNER_TEMP"
           --result "$RUNNER_TEMP/drive-mirror-result.json"
