@@ -300,7 +300,7 @@ def test_capture_duration_formats_real_and_recovered_outcomes_without_invalid_va
 
 # The shipped desktop uses one Tcl interpreter per process. Give each UI case
 # the same lifecycle; pytest's fd-capture swaps must not become Tcl channels.
-@pytest.mark.parametrize("case", ['window_opens_without_starting_collection_and_loads_current_counts', 'start_stop_buttons_control_backend_without_blocking_tk', 'invalid_options_do_not_start_collector', 'pvp_checkbox_controls_start_and_reflects_running_worker', 'cycle_coverage_remains_scoped_during_next_cycle', 'browser_reads_detail_unknown_ids_zero_values_and_event_pages', 'changed_filters_invalidate_slow_old_detail', 'existing_background_collector_prevents_second_start', 'refresh_preserves_account_when_two_accounts_share_battle_id', 'close_leaves_existing_collection_running', 'errors_are_visible_and_logs_are_bounded', 'last_capture_stays_visible_during_next_report_and_after_stop'])
+@pytest.mark.parametrize("case", ['compact_detail_shows_actual_dictionary_and_generation_failure', 'window_opens_without_starting_collection_and_loads_current_counts', 'start_stop_buttons_control_backend_without_blocking_tk', 'invalid_options_do_not_start_collector', 'pvp_checkbox_controls_start_and_reflects_running_worker', 'cycle_coverage_remains_scoped_during_next_cycle', 'browser_reads_detail_unknown_ids_zero_values_and_event_pages', 'changed_filters_invalidate_slow_old_detail', 'existing_background_collector_prevents_second_start', 'refresh_preserves_account_when_two_accounts_share_battle_id', 'close_leaves_existing_collection_running', 'errors_are_visible_and_logs_are_bounded', 'last_capture_stays_visible_during_next_report_and_after_stop'])
 def test_native_window_scenario(case):
     script = r"""
 import gc, runpy, sys
@@ -325,3 +325,21 @@ print('NATIVE_WINDOW_SCENARIO_OK')
     assert "NATIVE_WINDOW_SCENARIO_OK" in completed.stdout
     assert "Tcl_AsyncDelete" not in completed.stderr
     assert "Variable.__del__" not in completed.stderr
+
+
+def case_compact_detail_shows_actual_dictionary_and_generation_failure(view):
+    app, controller, data = view
+    detail = data.detail(8)
+    detail["semantics"] = {"available": True, "status": "ready", "event_storage": "on_demand",
+                           "version": "persisted-id-version", "on_demand_version": "actual-event-version-123"}
+    app._render_detail(detail)
+    text = app.info_text.get("1.0", "end")
+    assert "本页按需生成" in text and "actual-event…" in text
+    assert "persisted-id" not in text and "已有解释" not in text
+    assert "数字保留为原值" in app.events_text.get("1.0", "end")
+    detail["semantics"].update(on_demand_error="ValueError: 字典校验失败")
+    app._render_detail(detail)
+    text = app.info_text.get("1.0", "end")
+    assert "本页按需生成失败" in text and "原因：ValueError: 字典校验失败" in text
+    assert "原始数据可查" in text and "已有解释" not in text
+    assert not controller.started

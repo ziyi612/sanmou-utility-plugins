@@ -82,7 +82,7 @@ def test_revision_alias_and_sha_share_the_same_complete_provenance_bytes(tmp_pat
     alias = tmp_path / "battle_123_decrypted.json"
     exporter.atomic_json(alias, payload)
     collector = collector_module.BattleCollector(None, tmp_path, namespace="account")
-    expected = old_json_bytes({**payload, "discovery": [observation], "namespace": "account"})
+    expected = old_json_bytes({**payload, "discovery": [observation], "namespace": "account"}, compact=True)
     with patch.object(collector_module, "atomic_bytes", wraps=exporter.atomic_bytes) as publish, \
             patch.object(exporter.os, "fsync", wraps=os.fsync) as sync:
         revision = collector._capture_revision(entry, alias, update_alias=True)

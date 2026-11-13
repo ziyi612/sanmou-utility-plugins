@@ -1,4 +1,5 @@
--- Schema exported without rows from the archived battle database.
+-- Current software schema, including legacy archive tables; no user rows.
+-- New archives use schema 2; legacy schema 1 remains until the first cloud release.
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE battle_formations (
@@ -86,6 +87,14 @@ CREATE TABLE heroes (
 	PRIMARY KEY (id)
 );
 
+CREATE TABLE report_cloud_files(
+ file_id INTEGER PRIMARY KEY REFERENCES report_files(id), provider TEXT NOT NULL,
+ status TEXT NOT NULL, remote_file_id TEXT, object_name TEXT,
+ raw_sha256 TEXT NOT NULL, raw_byte_count INTEGER NOT NULL,
+ stored_sha256 TEXT, stored_byte_count INTEGER, codec TEXT NOT NULL DEFAULT 'gzip-v1',
+ verified_at TEXT, last_error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+ config_path TEXT NOT NULL);
+
 CREATE TABLE report_components(
  snapshot_id INTEGER NOT NULL REFERENCES report_snapshots(id), name TEXT NOT NULL,
  payload_json TEXT, requested INTEGER, available INTEGER NOT NULL, complete INTEGER,
@@ -133,6 +142,12 @@ CREATE TABLE report_records(
  first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
  UNIQUE(namespace,battle_uid));
 
+CREATE TABLE report_semantic_event_modes(snapshot_id INTEGER NOT NULL REFERENCES report_snapshots(id),version TEXT NOT NULL REFERENCES report_semantic_versions(version),event_mode TEXT NOT NULL CHECK(event_mode IN ('stored','on_demand')),PRIMARY KEY(snapshot_id,version));
+
+CREATE TABLE report_semantic_id_links(snapshot_id INTEGER NOT NULL,pointer TEXT NOT NULL,version TEXT NOT NULL,mapping_ref TEXT NOT NULL REFERENCES report_semantic_mapping_cache(mapping_ref),PRIMARY KEY(snapshot_id,pointer,version),FOREIGN KEY(snapshot_id,pointer,version) REFERENCES report_id_meanings(snapshot_id,pointer,version) ON DELETE CASCADE);
+
+CREATE TABLE report_semantic_mapping_cache(mapping_ref TEXT PRIMARY KEY,source_json TEXT NOT NULL,mapping_json TEXT NOT NULL);
+
 CREATE TABLE report_semantic_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 
 CREATE TABLE report_semantic_runs(snapshot_id INTEGER NOT NULL REFERENCES report_snapshots(id),version TEXT NOT NULL REFERENCES report_semantic_versions(version),status TEXT NOT NULL,error TEXT,id_count INTEGER NOT NULL DEFAULT 0,mapped_id_count INTEGER NOT NULL DEFAULT 0,event_count INTEGER NOT NULL DEFAULT 0,mapped_event_count INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(snapshot_id,version));
@@ -157,7 +172,7 @@ CREATE TABLE report_snapshots(
  file_id INTEGER NOT NULL REFERENCES report_files(id), document_index INTEGER NOT NULL,
  payload_json TEXT NOT NULL, source TEXT, capture_version INTEGER,
  completeness TEXT NOT NULL, quality_json TEXT NOT NULL, issues_json TEXT NOT NULL,
- event_count INTEGER NOT NULL, field_count INTEGER NOT NULL, imported_at TEXT NOT NULL,
+ event_count INTEGER NOT NULL, field_count INTEGER NOT NULL, imported_at TEXT NOT NULL, storage_mode TEXT NOT NULL DEFAULT 'full', indexed_field_count INTEGER,
  UNIQUE(file_id,document_index));
 
 CREATE TABLE skill_usages (
@@ -220,3 +235,5 @@ CREATE VIEW report_current_skills AS
 CREATE VIEW report_current_snapshots AS
  SELECT r.namespace,r.battle_uid,s.* FROM report_records r
  JOIN report_snapshots s ON s.id=r.current_snapshot_id;
+
+CREATE VIEW report_resolved_id_meanings AS SELECT m.snapshot_id,m.pointer,m.version,m.kind,m.raw_value_json,m.name_zh,m.mapped,m.status,COALESCE(c.source_json,m.source_json) source_json,COALESCE(c.mapping_json,m.mapping_json) mapping_json FROM report_id_meanings m LEFT JOIN report_semantic_id_links l ON l.snapshot_id=m.snapshot_id AND l.pointer=m.pointer AND l.version=m.version LEFT JOIN report_semantic_mapping_cache c ON c.mapping_ref=l.mapping_ref;

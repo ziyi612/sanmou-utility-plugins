@@ -26,7 +26,7 @@ def put(archive, value, namespace="one"):
 
 def restrict_status_reads(connection, observed):
     allowed = {"report_records": {"", "id", "current_snapshot_id"},
-               "report_snapshots": {"", "id", "report_id", "completeness", "event_count", "field_count"},
+               "report_snapshots": {"", "id", "report_id", "completeness", "event_count", "field_count", "indexed_field_count"},
                "report_files": {"", "id", "namespace", "sha256"}}
     def authorize(action, table, column, _database, _trigger):
         if action == sqlite3.SQLITE_READ:
@@ -77,6 +77,22 @@ def test_sql_authorizer_forbids_all_large_tables_and_payload_columns(tmp_path):
                       "SELECT COUNT(*) FROM report_fields", "SELECT COUNT(*) FROM report_events"):
             with pytest.raises(sqlite3.DatabaseError):
                 archive.connection.execute(query).fetchone()
+        archive.connection.set_authorizer(None)
+
+
+def test_compact_status_counts_actual_index_rows_without_large_table_reads(tmp_path):
+    with ReportArchive(tmp_path / "compact_status.db", storage_mode="compact") as archive:
+        put(archive, report(events=20))
+        stored = archive.connection.execute(
+            "SELECT field_count,indexed_field_count FROM report_snapshots").fetchone()
+        expected = archive.stats()["current_fields"]
+        assert expected == stored["indexed_field_count"] < stored["field_count"]
+        observed = []
+        restrict_status_reads(archive.connection, observed)
+        current = archive.collection_stats()
+        assert current["current_fields"] == expected
+        assert current["current_events"] == 20
+        assert {table for table, _ in observed} <= {"report_records", "report_snapshots", "report_files"}
         archive.connection.set_authorizer(None)
 
 

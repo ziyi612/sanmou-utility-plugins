@@ -18,7 +18,7 @@ def main(argv=None):
     parser.add_argument("--out-dir", type=Path, default=ROOT / "data/incoming/runtime")
     parser.add_argument("--interval", type=int, default=60)
     parser.add_argument("--pid", type=int)
-    parser.add_argument("--page", choices=("overview", "archive", "daily", "team_winrates", "opponents", "peerless", "logs"),
+    parser.add_argument("--page", choices=("overview", "archive", "daily", "team_winrates", "opponents", "peerless", "cloud", "logs"),
                         default="overview", help="打开界面后显示的页面，不会自动启动采集")
     parser.add_argument("--parallel", type=int, choices=range(1, 5),
                         help="并行预取窗口 1–4；未指定时读取 config/launcher.json 的 collector_parallelism")

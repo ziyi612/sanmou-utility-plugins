@@ -64,15 +64,21 @@ def _typed_key_types(payload: dict) -> dict:
     return value
 
 
-def _load_source(archive: ReportArchive, snapshot_id: int, namespace: str, battle_uid: str) -> dict:
+def _load_source(archive: ReportArchive, snapshot_id: int, namespace: str, battle_uid: str,
+                 prepared_originals: dict[int, bytes] | None = None) -> dict:
     row = archive.connection.execute(
-        "SELECT s.id,s.payload_json,s.document_index,r.namespace,r.battle_uid,f.namespace file_namespace,"
-        "f.raw_bytes,f.sha256,f.byte_count,f.parse_status FROM report_snapshots s "
+        "SELECT s.id,s.payload_json,s.file_id,s.document_index,r.namespace,r.battle_uid,f.namespace file_namespace,"
+        "f.sha256,f.byte_count,f.parse_status FROM report_snapshots s "
         "JOIN report_records r ON r.id=s.report_id JOIN report_files f ON f.id=s.file_id WHERE s.id=?",
         (snapshot_id,)).fetchone()
     if row is None or row["namespace"] != namespace or row["file_namespace"] != namespace or row["battle_uid"] != battle_uid:
         raise ComponentRecoveryError("Source snapshot does not belong to the explicitly selected account and battle")
-    raw = bytes(row["raw_bytes"])
+    try:
+        raw = prepared_originals.get(row["file_id"]) if prepared_originals is not None else None
+        if raw is None:
+            raw = archive.original_file_bytes(row["file_id"])
+    except (ValueError, OSError, RuntimeError, ImportError) as exc:
+        raise ComponentRecoveryError("A source original file is unavailable or failed its byte/hash validation") from exc
     if row["parse_status"] != "parsed" or len(raw) != row["byte_count"] or hashlib.sha256(raw).hexdigest() != row["sha256"]:
         raise ComponentRecoveryError("A source original file failed its byte/hash validation")
     document = json.loads(raw)
@@ -238,9 +244,29 @@ def build_component_recovery(db_path, *, namespace: str, battle_uid: str,
            for value in (primary_snapshot_id, snapshot_source_id)) or primary_snapshot_id == snapshot_source_id:
         raise ComponentRecoveryError("Choose two distinct explicit source snapshot IDs")
     with ReportArchive(db_path, read_only=True) as archive:
+        # Validate the explicitly selected ownership before resolving cloud
+        # objects, then complete any network work before the read transaction.
+        source_files = []
+        for snapshot_id in (primary_snapshot_id, snapshot_source_id):
+            source = archive.connection.execute(
+                "SELECT s.file_id FROM report_snapshots s JOIN report_records r ON r.id=s.report_id "
+                "JOIN report_files f ON f.id=s.file_id WHERE s.id=? AND r.namespace=? "
+                "AND f.namespace=? AND r.battle_uid=?", (snapshot_id, namespace, namespace, battle_uid)).fetchone()
+            if source is None:
+                raise ComponentRecoveryError("Source snapshot does not belong to the explicitly selected account and battle")
+            source_files.append(source[0])
+        # Only these two explicit originals are retained during reconstruction;
+        # a tiny shared cloud cache may evict either one during the next fetch.
+        prepared_originals = {}
+        for file_id in dict.fromkeys(source_files):
+            try:
+                prepared_originals[file_id] = archive.original_file_bytes(file_id)
+            except (ValueError, OSError, RuntimeError, ImportError) as exc:
+                raise ComponentRecoveryError("A source original file is unavailable or failed its byte/hash validation") from exc
+        archive._original_cache_only = True
         archive.connection.execute("BEGIN")
-        primary = _load_source(archive, primary_snapshot_id, namespace, battle_uid)
-        donor = _load_source(archive, snapshot_source_id, namespace, battle_uid)
+        primary = _load_source(archive, primary_snapshot_id, namespace, battle_uid, prepared_originals)
+        donor = _load_source(archive, snapshot_source_id, namespace, battle_uid, prepared_originals)
     if primary["identity"] != donor["identity"]:
         raise ComponentRecoveryError("The sources belong to different runtime accounts or scenarios")
     canonical = "server:{serverId}/scenario:{scenarioId}/avatar:{avatarId}".format(**primary["identity"])

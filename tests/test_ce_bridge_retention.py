@@ -4,7 +4,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from capture.cheatengine.ce_bridge import CEBridge
+import pytest
+
+CEBridge = pytest.importorskip(
+    "capture.cheatengine.ce_bridge",
+    reason="The optional CE bridge is outside this public battle-software distribution",
+).CEBridge
 
 
 class BridgeRetentionTests(unittest.TestCase):

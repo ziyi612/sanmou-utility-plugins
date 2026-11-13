@@ -6,9 +6,40 @@
 
 2026-11-13 完整数据库： [Google Drive 单文件（7.12 GB）](https://drive.google.com/file/d/14q4KEkgUb4kM-S0b2oiVC9dvC_JQ0BRQ/view?usp=drivesdk) · [GitHub Release 分卷](https://github.com/ziyi612/sanmou-utility-plugins/releases/tag/data-20261113) · [逐文件校验清单](data/releases/2026-11-13.json)。原 DB 与 WAL 合计约 114.21 GB；恢复前请阅读[空间需求及步骤](docs/database-archive.md)。
 
+## 省空间采集
+
+采集默认使用 `lean` 模式：保留完整原文、五组件、有序事件和统计元数据，省略事件、武将快照及统计组件的重复逐字段展开；相同中文名称映射的完整来源共享保存，事件中文说明在打开详情时按当前页生成。每日统计、队伍胜率、对手、无双和历史阵容查询继续使用本地投影。
+
+`collect --storage-mode compact` 可选择仅精简事件索引的方式，`--storage-mode full` 保存全部字段索引及持久中文事件说明。离线 `import` 默认仍为 `full`。同库可保留不同模式，重复导入不会转换旧快照；已有原件、归档和备份不会自动清理。模式区别与完整来源读取方式见[数据库说明](docs/battle_database.md)。
+
+## 夸克云端原文
+
+“夸克云端”页面提供登录、启用归档、查看状态及手动同步。首次启用前需由本人完成夸克账号授权；没有授权、上传超时或空间不足时，本地原文保留。安装器 `python -B tools/setup_quark.py` 会下载并核对固定版本的夸克官方运行时，写入不含令牌的 `config/quark.local.json`；账号凭据由官方工具保存在运行时目录内，不进入 GitHub。
+
+登录后点击“启用战报归档”，程序在本人网盘创建“三谋战报归档”目录。下一次开始采集时，后台线程会分批上传已入库原文；手动“同步接下来10份原文”也可同步。每份原文直接按原字节 gzip 压缩，上传后必须重新下载，验证压缩文件和解压原文的 SHA-256 与长度，最后才在事务中保存云端引用并释放数据库内嵌原文。没有校验完成的上传绝不计为迁移成功；失败任务可以重试，已取得文件ID的任务复用该ID继续回读。
+
+原文预览、导出、完整核验、组件恢复及阵容投影修复都使用统一的原文读取接口：本地原文优先，其次为经过校验的缓存，缺失时从夸克下载。默认缓存上限为 1 GiB；只有可从已验证云对象恢复的缓存可被驱逐。首次释放内嵌原文前会启用数据库版本2，以免旧程序把远程占位误当成空原文；新版仍能读取版本1数据库。
+
+本版仍保留本地完整快照、组件、事件和统计投影，因此日常统计不依赖网络。活动续采JSON与已有历史目录不自动清理。释放的数据库内嵌空间会成为可复用空闲页；停止采集后可用 `python -B battle_reports.py cloud compact` 回收空闲页，不能在采集运行时执行。只读SQL的 `report_files.raw_bytes` 在已迁移行中为空，读取原件须使用 `original_bytes` 或 `export`，云位置与校验状态在 `report_cloud_files`。
+
+```powershell
+python -B tools/setup_quark.py
+python -B battle_reports.py cloud login
+python -B battle_reports.py cloud init
+python -B battle_reports.py cloud status
+python -B battle_reports.py cloud sync --limit 10
+```
+
+已用本人授权的真实账号完成一份小样本上传、完整回读、清除缓存后的再次下载、原样导出与 SHA-256 一致性核验；这只证明该样本流程，不表示全部历史数据已经迁移。
+
+首次初始化需在夸克官方工具实际支持的 Codex 环境中执行。安装器仅在当前环境确实为 `CODEX_SHELL=1` 时保存这个原值，供后续桌面子进程沿用已经授权的适配器；没有该环境或值不符时不会补造标记，也不保存 Codex 线程标识、用户主目录或令牌。已完成本项目桌面子进程清除父进程 Codex 环境后、仅凭初始化配置读取已授权账号的验收；这不代表夸克官方提供通用 standalone SDK。
+
+配置示例见 `config/quark.example.json`。安装和缓存目录应使用有足够空间的工作盘。官方运行时的登录、会员及网络限制仍适用；本地离线测试不会被作为真实账号上传成功的证据。夸克官方工具说明见 [官方仓库](https://github.com/quark-clouddrive/quarkclouddrive_offical)。
+
+
 ## 安装
 
-使用 Windows 和 Python 3.10 或更新版本。官方 Windows Python 通常包含 Tkinter；实时采集另需 `frida`、`psutil`，Excel 导出使用 `openpyxl`，不需要 Node 或任何私人运行环境。
+使用 Windows 和 Python 3.10 或更新版本。官方 Windows Python 通常包含 Tkinter；实时采集另需 `frida`、`psutil`，Excel 导出使用 `openpyxl`。基础采集和查询不需要 Node；可选的夸克云端功能另需 Node.js 16 或更新版本，不依赖作者的私人运行环境。
 
 ```powershell
 python -m venv .venv

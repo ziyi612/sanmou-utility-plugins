@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "cli_command": ["node", "--require", "<项目绝对路径>/tools/quark_runtime_guard.cjs", "--require", "<项目绝对路径>/tools/quark_http_transport.cjs", "<夸克官方工具绝对路径>/scripts/quark-drive.cjs"],
+  "cli_env": {
+    "SANMOU_QUARK_AUTH_URL_FILE": "<项目绝对路径>/data/cloud/authorization-url.json",
+    "SANMOU_QUARK_BLOCK_C_WRITES": "1",
+    "SANMOU_QUARK_HTTP_TRANSPORT": "urllib",
+    "SANMOU_QUARK_PYTHON": "<Python解释器绝对路径>"
+  },
+  "cache_dir": "<项目绝对路径>/data/cloud/cache",
+  "cache_max_bytes": 1073741824,
+  "work_dir": "<项目绝对路径>/data/cloud/runtime",
+  "temp_dir": "<项目绝对路径>/data/cloud/temp",
+  "folder_id": null
+}

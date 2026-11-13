@@ -396,7 +396,7 @@ class BattleCollector:
         }
         if self.state.get("runtimeIdentity") is not None:
             payload["runtimeIdentity"] = self.state["runtimeIdentity"]
-        raw = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         path = self.out_dir / "captures" / str(battle_id) / (hashlib.sha256(raw).hexdigest() + ".json")
         if not path.exists():
             atomic_bytes(path, raw)
@@ -814,7 +814,7 @@ class BattleCollector:
         payload["namespace"] = self.namespace
         # Cache-before-retry files are already immutable. Enrich a new revision
         # without rewriting the exact bytes preserved before the client's retry.
-        raw = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         revision = self.out_dir / "captures" / str(entry["battleID"]) / f"{hashlib.sha256(raw).hexdigest()}.json"
         if not revision.exists():
             atomic_bytes(revision, raw)

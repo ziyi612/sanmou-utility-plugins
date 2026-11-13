@@ -1,7 +1,10 @@
 """Lossless SQLite archive for runtime battle reports (Python standard library only).
 
 The original bytes are authoritative. Query tables are reproducible projections,
-and ``report_fields`` indexes *every* JSON node using RFC 6901 JSON Pointers.
+and ``report_fields`` indexes JSON nodes using RFC 6901 JSON Pointers. The
+compact policy omits redundant event-list descendants from that projection;
+lean also omits recursive projections of statics and snapshots components.
+complete event objects and authoritative original bytes remain available.
 ``complete`` describes the five exported components, never account-wide coverage.
 Old exports have status ``legacy`` even when their source is ``all``.
 """
@@ -19,7 +22,9 @@ from typing import Any, Iterator
 
 
 COMPONENTS = ("basic", "detail", "all", "statics", "snapshots")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = ("1", "2")
+STORAGE_MODES = ("full", "compact", "lean")
 
 
 def _now() -> str:
@@ -89,6 +94,31 @@ def iter_fields(value: Any, pointer: str = "", parent: str | None = None,
         yield from iter_fields(child, pointer + "/" + _token(text_key), pointer, text_key, index)
 
 
+def _indexed_fields(fields: list[tuple], storage_mode: str) -> list[tuple]:
+    """Select query nodes without altering original data or quality checks.
+
+    Event bodies already have ordered rows in report_events and occur again in
+    the payload/components. Keep their array roots, but avoid a second large
+    per-scalar index. Unknown branches and all non-event metadata stay indexed.
+    """
+    if storage_mode == "full":
+        return fields
+    if storage_mode not in ("compact", "lean"):
+        raise ValueError(f"Unsupported report storage mode: {storage_mode!r}")
+    selected = []
+    for field in fields:
+        pointer = field[0]
+        if storage_mode == "lean" and pointer.startswith(("/components/snapshots/", "/components/statics/")):
+            continue
+        if pointer.startswith("/data/eventDataList/"):
+            continue
+        parts = pointer.split("/", 4)
+        if len(parts) == 5 and parts[1] == "components" and parts[3] == "eventDataList":
+            continue
+        selected.append(field)
+    return selected
+
+
 def _uid(value: Any) -> str | None:
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
@@ -141,6 +171,7 @@ CREATE TABLE IF NOT EXISTS report_snapshots(
  payload_json TEXT NOT NULL, source TEXT, capture_version INTEGER,
  completeness TEXT NOT NULL, quality_json TEXT NOT NULL, issues_json TEXT NOT NULL,
  event_count INTEGER NOT NULL, field_count INTEGER NOT NULL, imported_at TEXT NOT NULL,
+ storage_mode TEXT NOT NULL DEFAULT 'full', indexed_field_count INTEGER,
  UNIQUE(file_id,document_index));
 CREATE TABLE IF NOT EXISTS report_fields(
  snapshot_id INTEGER NOT NULL REFERENCES report_snapshots(id), pointer TEXT NOT NULL,
@@ -289,7 +320,11 @@ def _quality(payload: dict, fields: list[tuple], data: dict) -> tuple[str, list,
 class ReportArchive:
     """Atomic, append-only raw archive with best-snapshot query projections."""
 
-    def __init__(self, db_path: str | Path, read_only: bool = False, semantic_mapper=None):
+    def __init__(self, db_path: str | Path, read_only: bool = False, semantic_mapper=None,
+                 storage_mode: str = "full"):
+        if storage_mode not in STORAGE_MODES:
+            raise ValueError(f"storage_mode must be one of {STORAGE_MODES}")
+        self.storage_mode = storage_mode
         self.semantic_mapper = semantic_mapper
         self._semantic_archive = None
         self.read_only = read_only
@@ -306,8 +341,8 @@ class ReportArchive:
             version = None
             if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='report_meta'").fetchone():
                 version = self.connection.execute("SELECT value FROM report_meta WHERE key='schema_version'").fetchone()
-                if version is not None and version[0] != str(SCHEMA_VERSION):
-                    raise ValueError(f"Unsupported archive schema version {version[0]!r}; this program supports {SCHEMA_VERSION}")
+                if version is not None and version[0] not in SUPPORTED_SCHEMA_VERSIONS:
+                    raise ValueError(f"Unsupported archive schema version {version[0]!r}; this program supports {SUPPORTED_SCHEMA_VERSIONS}")
             if read_only:
                 required = {"report_" + name for name in ("meta", "files", "imports", "records", "snapshots", "fields", "components", "events", "sides", "heroes", "skills")}
                 required.update("report_current_" + name for name in ("snapshots", "events", "heroes", "fields", "sides", "skills"))
@@ -317,6 +352,7 @@ class ReportArchive:
                 # This changes only connection-local temporary storage. No
                 # persistent journal/schema setting is modified in read mode.
                 self.connection.execute("PRAGMA temp_store=MEMORY")
+                self._snapshot_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(report_snapshots)")}
                 return
             self.connection.execute("PRAGMA foreign_keys=ON")
             self.connection.execute("PRAGMA busy_timeout=30000")
@@ -324,7 +360,16 @@ class ReportArchive:
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.executescript(_DDL)
             with self.connection:
+                # Additive metadata lets old full-index snapshots coexist with
+                # new compact ones. A read-only open never changes old schemas.
+                self.connection.execute("BEGIN IMMEDIATE")
+                columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(report_snapshots)")}
+                if "storage_mode" not in columns:
+                    self.connection.execute("ALTER TABLE report_snapshots ADD COLUMN storage_mode TEXT NOT NULL DEFAULT 'full'")
+                if "indexed_field_count" not in columns:
+                    self.connection.execute("ALTER TABLE report_snapshots ADD COLUMN indexed_field_count INTEGER")
                 self.connection.execute("INSERT OR IGNORE INTO report_meta VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
+            self._snapshot_columns = columns | {"storage_mode", "indexed_field_count"}
         except BaseException:
             self.connection.close()
             raise
@@ -362,7 +407,13 @@ class ReportArchive:
         if self.semantic_mapper is not None and result.get("status") in {"imported", "duplicate"}:
             try:
                 semantics = self.semantic_archive()
-                items = [semantics.enrich_snapshot(sid) for sid in result.get("snapshot_ids", [])]
+                items = []
+                for sid in result.get("snapshot_ids", []):
+                    # Duplicates retain their original storage policy even if
+                    # imported through a differently configured connection.
+                    stored_mode = self.connection.execute(
+                        "SELECT storage_mode FROM report_snapshots WHERE id=?", (sid,)).fetchone()[0]
+                    items.append(semantics.enrich_snapshot(sid, include_events=stored_mode == "full"))
                 result["semantics"] = {"version": self.semantic_mapper.version, "results": items,
                                        "failed": sum(item.get("status") == "failed" for item in items)}
             except Exception as exc:
@@ -506,17 +557,19 @@ class ReportArchive:
             if candidate_id is not None and candidate_id != battle_uid:
                 raise ValueError(f"Conflicting battleID: {battle_uid} versus {candidate_id}")
         fields = list(iter_fields(payload))
+        indexed_fields = _indexed_fields(fields, self.storage_mode)
         completeness, quality, issues = _quality(payload, fields, data)
         events = data.get("eventDataList") if isinstance(data.get("eventDataList"), list) else []
         now = _now()
         self.connection.execute("INSERT OR IGNORE INTO report_records(namespace,battle_uid,first_seen,last_seen) VALUES(?,?,?,?)", (namespace, battle_uid, now, now))
         record = self.connection.execute("SELECT id,current_snapshot_id FROM report_records WHERE namespace=? AND battle_uid=?", (namespace, battle_uid)).fetchone()
         cursor = self.connection.execute(
-            "INSERT INTO report_snapshots(report_id,file_id,document_index,payload_json,source,capture_version,completeness,quality_json,issues_json,event_count,field_count,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO report_snapshots(report_id,file_id,document_index,payload_json,source,capture_version,completeness,quality_json,issues_json,event_count,field_count,imported_at,storage_mode,indexed_field_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (record["id"], file_id, index, _json(payload), _text(payload.get("source")), _int(payload.get("captureVersion")),
-             completeness, _json(quality), _json(issues), len(events), len(fields), now))
+             completeness, _json(quality), _json(issues), len(events), len(fields), now,
+             self.storage_mode, len(indexed_fields)))
         snapshot_id = cursor.lastrowid
-        self.connection.executemany("INSERT INTO report_fields VALUES(?,?,?,?,?,?,?,?)", ((snapshot_id, *field) for field in fields))
+        self.connection.executemany("INSERT INTO report_fields VALUES(?,?,?,?,?,?,?,?)", ((snapshot_id, *field) for field in indexed_fields))
         components = _mapping(payload.get("components"))
         statuses = _mapping(payload.get("componentStatus"))
         for name in sorted(set(COMPONENTS) | set(components) | set(statuses)):
@@ -543,6 +596,7 @@ class ReportArchive:
         self.connection.execute("UPDATE report_records SET last_seen=?,current_snapshot_id=? WHERE id=?", (now, snapshot_id if selected else current_id, record["id"]))
         return {"id": snapshot_id, "battle_uid": battle_uid, "completeness": completeness,
                 "event_count": len(events), "field_count": len(fields), "selected_current": selected, "issues": issues,
+                "storage_mode": self.storage_mode, "indexed_field_count": len(indexed_fields),
                 "capture_kind": payload.get("captureKind"), "component_status": statuses,
                 "settlement_source_pointer": settlement_pointer}
 
@@ -575,12 +629,12 @@ class ReportArchive:
             try:
                 row = self.connection.execute(
                     "SELECT s.payload_json,s.file_id,s.document_index,s.report_id,r.battle_uid,r.namespace,"
-                    "r.current_snapshot_id,f.raw_bytes,f.sha256,f.byte_count FROM report_snapshots s "
+                    "r.current_snapshot_id,f.sha256,f.byte_count FROM report_snapshots s "
                     "JOIN report_records r ON r.id=s.report_id JOIN report_files f ON f.id=s.file_id "
                     "WHERE s.id=?", (snapshot_id,)).fetchone()
                 if row is None:
                     raise KeyError(f"Unknown snapshot ID {snapshot_id}")
-                raw = bytes(row["raw_bytes"])
+                raw = self.original_file_bytes(row["file_id"])
                 if hashlib.sha256(raw).hexdigest() != row["sha256"] or len(raw) != row["byte_count"]:
                     raise ValueError("Original file hash does not match; no projection repaired")
                 document = _decode(raw)
@@ -634,11 +688,40 @@ class ReportArchive:
             raise KeyError(snapshot_id)
         return _decode(row[0])
 
+    def original_file_bytes(self, file_id: int) -> bytes:
+        """Read a validated inline original or its verified cloud counterpart.
+
+        Remote resolution may fill an F-drive cache, but never changes archive
+        rows. Empty offloaded placeholders are not original bytes. Verification
+        can require a cache-only lookup while holding its SQLite read snapshot.
+        """
+        row = self.connection.execute(
+            "SELECT raw_bytes,sha256,byte_count FROM report_files WHERE id=?", (file_id,)).fetchone()
+        if row is None:
+            raise KeyError(file_id)
+        raw = bytes(row["raw_bytes"])
+        if len(raw) == row["byte_count"] and hashlib.sha256(raw).hexdigest() == row["sha256"]:
+            return raw
+        has_cloud_table = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='report_cloud_files'").fetchone()
+        verified = has_cloud_table and self.connection.execute(
+            "SELECT 1 FROM report_cloud_files WHERE file_id=? AND status='verified'", (file_id,)).fetchone()
+        if not verified:
+            raise ValueError(f"Original file {file_id} failed byte/hash validation and has no verified cloud reference")
+        from .quark_cloud import resolve_original
+        if getattr(self, "_original_cache_only", False):
+            raw = resolve_original(self.connection, file_id, self.db_path, allow_network=False)
+        else:
+            raw = resolve_original(self.connection, file_id, self.db_path)
+        if not isinstance(raw, bytes) or len(raw) != row["byte_count"] or hashlib.sha256(raw).hexdigest() != row["sha256"]:
+            raise ValueError(f"Cloud original file {file_id} failed archive byte/hash validation")
+        return raw
+
     def original_bytes(self, snapshot_id: int) -> bytes:
-        row = self.connection.execute("SELECT f.raw_bytes FROM report_snapshots s JOIN report_files f ON f.id=s.file_id WHERE s.id=?", (snapshot_id,)).fetchone()
+        row = self.connection.execute("SELECT file_id FROM report_snapshots WHERE id=?", (snapshot_id,)).fetchone()
         if row is None:
             raise KeyError(snapshot_id)
-        return bytes(row[0])
+        return self.original_file_bytes(row[0])
 
     def protect_output_path(self, path: str | Path) -> Path:
         """Reject output paths that alias the database or SQLite sidecars."""
@@ -679,17 +762,19 @@ class ReportArchive:
     def collection_stats(self) -> dict:
         """Small collection-status counters, without historical payload scans.
 
-        Event and field totals sum the exact lengths recorded when each current
-        snapshot was indexed. They are not counts of historical projection rows.
+        Event and field totals sum the stored projection counts for each current
+        snapshot. They are not counts of historical projection rows.
         Files/snapshots use their small covering indexes for CLI compatibility.
         Full historical statistics remain available through stats().
         """
         self.connection.execute("SAVEPOINT archive_collection_stats")
         try:
+            field_count = ("COALESCE(s.indexed_field_count,s.field_count)"
+                           if "indexed_field_count" in self._snapshot_columns else "s.field_count")
             rows = list(self.connection.execute(
                 "SELECT s.completeness,COUNT(*) records,COUNT(s.id) current_reports,"
                 "COALESCE(SUM(s.event_count),0) current_events,"
-                "COALESCE(SUM(s.field_count),0) current_fields "
+                f"COALESCE(SUM({field_count}),0) current_fields "
                 "FROM report_records r LEFT JOIN report_snapshots s "
                 "ON s.id=r.current_snapshot_id AND s.report_id=r.id GROUP BY s.completeness"))
             result = {
@@ -721,16 +806,66 @@ class ReportArchive:
         return counts
 
     def verify(self) -> dict:
+        prewarm_errors, cloud_originals = [], {}
+        # A SELECT is fully materialized before any download. Do not hold a
+        # SQLite read snapshot across network waits, which would retain WAL.
+        # A caller-owned transaction cannot be released here; in that case
+        # verification uses only originals already available in the cache.
+        if self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='report_cloud_files'").fetchone():
+            files = list(self.connection.execute(
+                "SELECT f.id,f.sha256,f.byte_count,f.parse_status FROM report_files f "
+                "JOIN report_cloud_files c ON c.file_id=f.id "
+                "WHERE c.status='verified' AND length(f.raw_bytes)=0 AND f.byte_count>0 ORDER BY f.id"))
+            previous_cache_only = getattr(self, "_original_cache_only", False)
+            self._original_cache_only = previous_cache_only or self.connection.in_transaction
+            try:
+                for file in files:
+                    file_id = file["id"]
+                    try:
+                        raw = self.original_file_bytes(file_id)
+                        if len(raw) != file["byte_count"] or hashlib.sha256(raw).hexdigest() != file["sha256"]:
+                            raise ValueError("Original file metadata changed while preparing verification")
+                        summary = dict(file)
+                        summary.update(document_hashes=[], decode_error=None)
+                        if file["parse_status"] == "parsed":
+                            try:
+                                document = _decode(raw)
+                                documents = document if isinstance(document, list) else [document]
+                                summary["document_hashes"] = [hashlib.sha256(_json(value).encode("ascii")).hexdigest()
+                                                              for value in documents]
+                            except Exception as exc:
+                                summary["decode_error"] = f"{type(exc).__name__}: {exc}"
+                        cloud_originals[file_id] = summary
+                    except Exception as exc:
+                        prewarm_errors.append({"file_id": file_id, "check": "cloud_original_prewarm",
+                                               "error": f"{type(exc).__name__}: {exc}"})
+            finally:
+                self._original_cache_only = previous_cache_only
+            # Only hashes/counts survive preparation; neither original bytes nor
+            # the whole cloud corpus has to remain in memory or the disk cache.
+            if files:
+                raw = document = documents = None
         # Pin a single read snapshot so a live importer cannot appear halfway
         # through a committed batch during the multi-query verification.
+        previous_cache_only = getattr(self, "_original_cache_only", False)
         self.connection.execute("SAVEPOINT archive_verify")
+        self._original_cache_only = True
         try:
-            return self._verify_snapshot()
+            result = self._verify_snapshot(cloud_originals)
+            if prewarm_errors:
+                result["errors"][:0] = prewarm_errors
+                result["ok"] = False
+            return result
         finally:
-            self.connection.execute("RELEASE SAVEPOINT archive_verify")
+            try:
+                self.connection.execute("RELEASE SAVEPOINT archive_verify")
+            finally:
+                self._original_cache_only = previous_cache_only
 
-    def _verify_snapshot(self) -> dict:
-        """Independently recompute bytes, every node, event and relational projection."""
+    def _verify_snapshot(self, cloud_originals: dict | None = None) -> dict:
+        """Recompute bytes, quality, policy-selected nodes, events and relations."""
+        cloud_originals = cloud_originals or {}
         errors: list[dict] = []
         integrity = [r[0] for r in self.connection.execute("PRAGMA integrity_check")]
         foreign_keys = [tuple(row) for row in self.connection.execute("PRAGMA foreign_key_check")]
@@ -747,36 +882,75 @@ class ReportArchive:
         if wrong_relations:
             errors.append({"check": "relation_snapshot_ownership", "records": wrong_relations})
         files_checked = 0
+        offloaded_files, verified_cloud_originals = set(), {}
         for row in self.connection.execute("SELECT id,raw_bytes,sha256,byte_count,parse_status FROM report_files"):
             files_checked += 1
             raw = bytes(row["raw_bytes"])
-            if hashlib.sha256(raw).hexdigest() != row["sha256"] or len(raw) != row["byte_count"]:
+            summary = None
+            if not raw and row["byte_count"] > 0:
+                offloaded_files.add(row["id"])
+                candidate = cloud_originals.get(row["id"])
+                if candidate is None:
+                    errors.append({"file_id": row["id"], "check": "raw_bytes_sha256",
+                                   "error": "Cloud original was not validated before the verification snapshot"})
+                elif any(candidate[key] != row[key] for key in ("sha256", "byte_count", "parse_status")):
+                    errors.append({"file_id": row["id"], "check": "cloud_original_metadata",
+                                   "error": "Original file metadata changed after cloud validation"})
+                elif not self.connection.execute(
+                        "SELECT 1 FROM report_cloud_files WHERE file_id=? AND status='verified'", (row["id"],)).fetchone():
+                    errors.append({"file_id": row["id"], "check": "cloud_original_metadata",
+                                   "error": "Cloud original no longer has a verified reference"})
+                else:
+                    summary = candidate
+                    verified_cloud_originals[row["id"]] = summary
+            elif hashlib.sha256(raw).hexdigest() != row["sha256"] or len(raw) != row["byte_count"]:
                 errors.append({"file_id": row["id"], "check": "raw_bytes_sha256"})
             indexed = [r[0] for r in self.connection.execute("SELECT document_index FROM report_snapshots WHERE file_id=? ORDER BY document_index", (row["id"],))]
             if row["parse_status"] == "parsed":
                 try:
-                    value = _decode(raw)
-                    expected = list(range(len(value))) if isinstance(value, list) else [0]
+                    if row["id"] in offloaded_files:
+                        if summary is None:
+                            raise ValueError("Cloud original was not validated before the verification snapshot")
+                        if summary["decode_error"]:
+                            raise ValueError(summary["decode_error"])
+                        expected = list(range(len(summary["document_hashes"])))
+                    else:
+                        value = _decode(raw)
+                        expected = list(range(len(value))) if isinstance(value, list) else [0]
                     if not expected or indexed != expected:
                         errors.append({"file_id": row["id"], "check": "file_snapshot_coverage", "expected": expected, "actual": indexed})
                 except Exception as exc:
                     errors.append({"file_id": row["id"], "check": "parsed_file_decode", "error": str(exc)})
             elif indexed:
                 errors.append({"file_id": row["id"], "check": "unparsed_file_has_snapshots"})
-        snapshots_checked = fields_checked = events_checked = 0
+        snapshots_checked = fields_checked = indexed_fields_checked = events_checked = 0
         original_file_id, original_document = None, None
         for row in self.connection.execute("SELECT * FROM report_snapshots ORDER BY file_id,document_index"):
             sid = row["id"]
             snapshots_checked += 1
             try:
                 payload = _decode(row["payload_json"])
-                if original_file_id != row["file_id"]:
-                    original_document = _decode(self.original_bytes(sid))
-                    original_file_id = row["file_id"]
-                original = original_document[row["document_index"]] if isinstance(original_document, list) else original_document
-                if _json(payload) != _json(original):
-                    errors.append({"snapshot_id": sid, "check": "payload_matches_original"})
-                payload = original
+                if row["file_id"] in offloaded_files:
+                    summary = verified_cloud_originals.get(row["file_id"])
+                    if summary is None or summary["decode_error"]:
+                        raise ValueError("Cloud original document was not validated before the verification snapshot")
+                    index = row["document_index"]
+                    actual_hash = hashlib.sha256(_json(payload).encode("ascii")).hexdigest()
+                    if not 0 <= index < len(summary["document_hashes"]) or actual_hash != summary["document_hashes"][index]:
+                        errors.append({"snapshot_id": sid, "check": "payload_matches_original"})
+                        # Never use an unproven local payload as the authority
+                        # for checking its field/component/event projections.
+                        continue
+                else:
+                    if original_file_id != row["file_id"]:
+                        original_raw = self.connection.execute(
+                            "SELECT raw_bytes FROM report_files WHERE id=?", (row["file_id"],)).fetchone()[0]
+                        original_document = _decode(bytes(original_raw))
+                        original_file_id = row["file_id"]
+                    original = original_document[row["document_index"]] if isinstance(original_document, list) else original_document
+                    if _json(payload) != _json(original):
+                        errors.append({"snapshot_id": sid, "check": "payload_matches_original"})
+                    payload = original
                 identity = self.connection.execute(
                     "SELECT r.namespace,r.battle_uid,f.namespace AS file_namespace FROM report_records r "
                     "JOIN report_files f ON f.id=? WHERE r.id=?", (row["file_id"], row["report_id"])).fetchone()
@@ -787,10 +961,16 @@ class ReportArchive:
                 if row["source"] != _text(payload.get("source")) or row["capture_version"] != _int(payload.get("captureVersion")):
                     errors.append({"snapshot_id": sid, "check": "snapshot_metadata"})
                 expected_fields = list(iter_fields(payload))
+                storage_mode = row["storage_mode"] if "storage_mode" in row.keys() else "full"
+                expected_indexed_fields = _indexed_fields(expected_fields, storage_mode)
                 actual_fields = [tuple(field) for field in self.connection.execute("SELECT pointer,parent_pointer,field_key,ordinal,node_type,value_json,scalar_text FROM report_fields WHERE snapshot_id=?", (sid,))]
                 fields_checked += len(expected_fields)
-                if sorted(expected_fields) != sorted(actual_fields) or row["field_count"] != len(expected_fields):
+                indexed_fields_checked += len(expected_indexed_fields)
+                if sorted(expected_indexed_fields) != sorted(actual_fields) or row["field_count"] != len(expected_fields):
                     errors.append({"snapshot_id": sid, "check": "all_fields"})
+                if ("indexed_field_count" in row.keys() and row["indexed_field_count"] is not None
+                        and row["indexed_field_count"] != len(expected_indexed_fields)):
+                    errors.append({"snapshot_id": sid, "check": "indexed_field_count"})
                 source_components = _mapping(payload.get("components"))
                 source_statuses = _mapping(payload.get("componentStatus"))
                 expected_components = []
@@ -844,4 +1024,5 @@ class ReportArchive:
                 errors.append({"snapshot_id": sid, "check": "verification_exception", "error": str(exc)})
         return {"ok": not errors, "files_checked": files_checked, "snapshots_checked": snapshots_checked,
                 "fields_checked": fields_checked, "events_checked": events_checked, "errors": errors,
+                "indexed_fields_checked": indexed_fields_checked,
                 "scope": "Stored original bytes and their indexed projections; does not prove account-wide collection or client completeness."}

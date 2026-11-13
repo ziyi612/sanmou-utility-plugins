@@ -283,7 +283,7 @@ class BattleApp(tk.Tk):
         self.nav_buttons = {}
         for key, title in (("overview", "采集总览"), ("archive", "战报档案"), ("daily", "每日统计"),
                            ("team_winrates", "队伍胜率"), ("opponents", "对手名单"),
-                           ("peerless", "无双记录"), ("logs", "运行记录")):
+                           ("peerless", "无双记录"), ("cloud", "夸克云端"), ("logs", "运行记录")):
             button = tk.Button(sidebar, text=title, anchor="w", command=lambda k=key: self.show_page(k),
                                relief="flat", bd=0, padx=22, pady=13, cursor="hand2",
                                bg=NAVY, activebackground="#28445f", fg="#d1dceb", activeforeground="white",
@@ -315,6 +315,7 @@ class BattleApp(tk.Tk):
         self._build_team_winrates()
         self._build_opponents()
         self._build_peerless()
+        self._build_cloud()
         self._build_logs()
         footer = tk.Frame(content, bg=BG)
         footer.pack(side="bottom", fill="x", pady=(10, 0), before=self.page_host)
@@ -475,6 +476,14 @@ class BattleApp(tk.Tk):
         self.export_button.pack(side="bottom", fill="x", pady=(10, 0), before=tabs)
         tk.Label(page, text="每封只展示当前最完整版本；事件按页读取，导出原文包含所有字段。", bg=BG,
                  fg=MUTED, anchor="w", font=("Microsoft YaHei UI", 9)).pack(side="bottom", fill="x", pady=(8, 0), before=panes)
+
+    def _build_cloud(self):
+        from .cloud_panel import CloudPanel
+        page = self._page_frame("cloud")
+        self.cloud_panel = CloudPanel(page, root_path=self.root_path,
+            db_path=getattr(self.data, "db_path", self.root_path / "data/database/battle_reports.db"),
+            submit=self._submit)
+        self.cloud_panel.pack(fill="both", expand=True)
 
     def _build_logs(self):
         page = self._page_frame("logs")
@@ -883,6 +892,7 @@ class BattleApp(tk.Tk):
                  "team_winrates": ("队伍胜率", "双方队伍均统计；分别查看区分战法与不区分战法的组合表现。"),
                  "opponents": ("对手名单", "只保留最近有战报数据的一天；名单代表战报观察，不代表实时阵容。"),
                  "peerless": ("无双记录", "记录任一玩家打出无双的那次战报，按次保留当事人信息。"),
+                 "cloud": ("夸克云端", "完整原文压缩上传，查看和导出时自动读取缓存或云端。"),
                  "logs": ("运行记录", "连接、采集和入库错误会在这里显示。")}
         self.title_var.set(names[page][0])
         self.subtitle_var.set(names[page][1])
@@ -898,10 +908,14 @@ class BattleApp(tk.Tk):
             self.load_opponents()
         elif load and page == "peerless":
             self.load_peerless()
+        elif load and page == "cloud":
+            self.cloud_panel.refresh()
 
     def refresh(self):
         self._next_overview = time.monotonic() + 15
         self._submit("overview", self.data.overview, self._render_overview)
+        if self._page == "cloud":
+            self.cloud_panel.refresh()
         if self._page == "archive":
             self.load_reports(reset=False)
         elif self._page == "daily":
@@ -1797,8 +1811,16 @@ class BattleApp(tk.Tk):
                     lines.append("  战法：" + "、".join(str(item.get("name_zh") or item.get("name") or f"ID {item.get('skill_uid', item.get('skill_id', item.get('id', '?')))}") for item in skills))
             lines.append("")
         sem = result.get("semantics", {})
-        lines += ["中文解释：" + ("已有解释，未知项保留原值。" if sem.get("available") and sem.get("status") == "ready" else "该版本解释尚未就绪，原始数据可查。"),
-                  "", "本页只读查看；导出原文包含全部字段。"]
+        if sem.get("event_storage") == "on_demand":
+            semantic_note = "中文事件解释：本页按需生成，未知项保留原值。"
+            if sem.get("on_demand_error"):
+                semantic_note = "中文事件解释：本页按需生成失败，原始数据可查。\n原因：" + str(sem["on_demand_error"])
+            if sem.get("on_demand_version"):
+                version = str(sem["on_demand_version"])
+                semantic_note += "\n本页实际字典版本：" + version[:12] + ("…" if len(version) > 12 else "")
+        else:
+            semantic_note = "中文解释：" + ("已有解释，未知项保留原值。" if sem.get("available") and sem.get("status") == "ready" else "该版本解释尚未就绪，原始数据可查。")
+        lines += [semantic_note, "", "本页只读查看；导出原文包含全部字段。"]
         self._set_text(self.info_text, "\n".join(lines))
         events = result.get("events", [])
         parts = []

@@ -23,6 +23,14 @@ oauth*.json
 config/local.*
 config/settings.yaml
 config/launcher.local.json
+config/quark.local.json
+config/quark.credentials.*
+cookies*.json
+cookies*.txt
+session*.json
+.quark/
+.quark-drive/
+quark-cli-auth/
 # Real battle data and all SQLite sidecars belong in external archives
 *.db
 *.db-*
@@ -33,11 +41,14 @@ config/launcher.local.json
 *-wal
 *-shm
 *-journal
+*.collector.lock
+*.cloud.lock
 data/incoming/
 data/archive/
 data/raw/
 data/normalized/
 data/processed/
+data/cloud/
 capture/output/
 logs/
 output/

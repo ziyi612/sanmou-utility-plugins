@@ -140,6 +140,11 @@ def collector_lock(path: Path):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="战报全字段归档：采集、入库、查询和完整性核验")
     sub = parser.add_subparsers(dest="command", required=True)
+    cloud = sub.add_parser("cloud", help="连接夸克、同步压缩原文和查看缓存状态")
+    cloud.add_argument("action", choices=("status", "login", "init", "sync", "compact"))
+    cloud.add_argument("--db", type=Path, default=DEFAULT_DB)
+    cloud.add_argument("--config", type=Path)
+    cloud.add_argument("--limit", type=int, default=10)
     for name, help_text in [("import", "导入原始战报 JSON"), ("collect", "持续采集个人、同盟和收藏战报"),
                             ("status", "查看数据库计数和战报列表"), ("verify", "逐字段核对数据库与原文件"),
                             ("export", "按快照 ID 导出原始文件"), ("query", "只读 SQL 查询"),
@@ -149,6 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name in {"import", "collect"}:
             p.add_argument("--namespace", default="auto" if name == "collect" else "default",
                            help="账号/服务器标识；采集默认按当前角色、服务器和赛季自动隔离")
+            p.add_argument("--storage-mode", choices=("lean", "compact", "full"),
+                           default="lean" if name == "collect" else "full",
+                           help="lean保留原文和事件，精简事件/武将快照/统计字段索引并共享名称来源；compact仅精简事件索引；两者事件中文按页解释，full保存全部索引和解释")
         if name == "import":
             p.add_argument("paths", nargs="*", type=Path, default=[DEFAULT_REPORTS])
             p.add_argument("--pattern", default="battle_*_decrypted.json")
@@ -732,8 +740,6 @@ def explain_report(archive, battle_id: str, namespace: str | None = None, limit:
     if limit < 1:
         raise ValueError("--limit must be positive")
     state = semantic_stats(archive.connection)
-    if not state.get("active_version"):
-        raise ValueError("中文解释尚未生成，请先运行 battle_reports.py enrich")
     params = [str(battle_id)]
     where = "battle_uid=?"
     if namespace is not None:
@@ -747,10 +753,17 @@ def explain_report(archive, battle_id: str, namespace: str | None = None, limit:
         raise ValueError("该战报在多个账号中出现，请用 --namespace 指定账号")
     report = dict(rows[0])
     snapshot_id = report["id"]
+    columns = {row[1] for row in archive.connection.execute("PRAGMA table_info(report_snapshots)")}
+    compact = "storage_mode" in columns and archive.connection.execute(
+        "SELECT storage_mode FROM report_snapshots WHERE id=?", (snapshot_id,)).fetchone()[0] in ("compact", "lean")
+    active_version = state.get("active_version")
+    if not active_version and not compact:
+        raise ValueError("中文解释尚未生成，请先运行 battle_reports.py enrich")
     ids, seen = [], set()
-    for row in archive.connection.execute(
+    id_rows = archive.connection.execute(
             "SELECT pointer,kind,raw_value_json,name_zh,mapped,status FROM report_current_id_meanings "
-            "WHERE snapshot_id=? ORDER BY pointer", (snapshot_id,)):
+            "WHERE snapshot_id=? ORDER BY pointer", (snapshot_id,)) if active_version else []
+    for row in id_rows:
         item = dict(row)
         key = (item["kind"], item["raw_value_json"], item["name_zh"])
         if key in seen:
@@ -759,18 +772,40 @@ def explain_report(archive, battle_id: str, namespace: str | None = None, limit:
         item["raw_value"] = json.loads(item.pop("raw_value_json"))
         ids.append(item)
     events = []
-    for row in archive.connection.execute(
+    meaning_rows = archive.connection.execute(
             "SELECT sequence,event_id,event_name_zh,summary_zh,parameters_json,status FROM report_current_event_meanings "
-            "WHERE snapshot_id=? ORDER BY sequence LIMIT ?", (snapshot_id, limit)):
+            "WHERE snapshot_id=? ORDER BY sequence LIMIT ?", (snapshot_id, limit)) if active_version else []
+    for row in meaning_rows:
         item = dict(row)
         item["parameters"] = json.loads(item.pop("parameters_json"))
         events.append(item)
     run = archive.connection.execute(
         "SELECT status,error FROM report_semantic_runs WHERE snapshot_id=? AND version=?",
-        (snapshot_id, state["active_version"])).fetchone()
-    return {"report": report, "mapping_version": state["active_version"],
+        (snapshot_id, active_version)).fetchone() if active_version else None
+    event_mapping_version = active_version
+    event_storage = "stored"
+    if compact:
+        raw_events = archive.connection.execute(
+            "SELECT sequence,event_id,raw_json FROM report_events WHERE snapshot_id=? ORDER BY sequence LIMIT ?",
+            (snapshot_id, limit)).fetchall()
+        stored = {event["sequence"]: event for event in events}
+        missing = [row for row in raw_events if row["sequence"] not in stored]
+        if missing:
+            from parser.report_semantics import decode_events_on_demand
+            decoded = decode_events_on_demand(archive.connection, snapshot_id, missing)
+            event_mapping_version = decoded["version"]
+            event_storage = "on_demand"
+            stored.update((event["sequence"], event) for event in decoded["events"])
+            events = [stored.get(row["sequence"], {
+                "sequence": row["sequence"], "event_id": row["event_id"],
+                "event_name_zh": None, "summary_zh": None, "parameters": [],
+                "status": "not_generated", "raw": json.loads(row["raw_json"]),
+                "error": decoded.get("error"),
+            }) for row in raw_events]
+    return {"report": report, "mapping_version": active_version,
             "mapping_run": dict(run) if run else {"status": "pending"},
             "ids": ids, "events": events, "events_limit": limit,
+            "event_mapping_version": event_mapping_version, "event_storage": event_storage,
             "note": "保留原始ID和数字参数；mapped表示有来源的解释，未核实项明确保留。"}
 
 
@@ -792,6 +827,32 @@ def main(argv=None) -> int:
             if not args.namespace.strip():
                 raise ValueError("Namespace must not be empty")
         db_path = output_path(args.db)
+        if args.command == "cloud":
+            from parser.quark_cloud import (cloud_status, load_config, QuarkClient,
+                                           initialize_folder, sync_archive, public_result, login_with_browser)
+            if args.action == "status":
+                emit(cloud_status(db_path, args.config))
+            elif args.action == "login":
+                emit(public_result(login_with_browser(load_config(args.config),
+                    notify=lambda message: print(message, file=sys.stderr, flush=True))))
+            elif args.action == "init":
+                emit(initialize_folder(args.config))
+            elif args.action == "sync":
+                result = sync_archive(db_path, config_path=args.config, limit=args.limit)
+                emit(result)
+                return 2 if result["failed"] else 0
+            elif args.action == "compact":
+                if not db_path.is_file():
+                    raise FileNotFoundError(db_path)
+                with collector_lock(db_path.with_suffix(".collector.lock")):
+                    before = db_path.stat().st_size
+                    with closing(sqlite3.connect(str(db_path), timeout=5)) as connection:
+                        connection.execute("PRAGMA temp_store=MEMORY")
+                        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        connection.execute("VACUUM")
+                    emit({"before_bytes": before, "after_bytes": db_path.stat().st_size,
+                          "message": "已回收数据库空闲页；战报投影和云端原文保留。"})
+            return 0
         if args.command == "collect":
             # Refuse before opening a writable database or attaching to the game.
             CollectionStorageGuard((db_path.parent, output_path(args.out_dir)), args.min_free_gib).check()
@@ -823,7 +884,7 @@ def main(argv=None) -> int:
         if semantic_warning:
             emit({"semantic_warning": semantic_warning, "message": "原文入库继续；中文解释可稍后重试。"})
         with ReportArchive(db_path, read_only=args.command in {"status", "verify", "export", "explain"},
-                           semantic_mapper=mapper) as archive:
+                           semantic_mapper=mapper, storage_mode=getattr(args, "storage_mode", "full")) as archive:
             if args.command == "import":
                 paths = set()
                 for path in args.paths:
@@ -839,7 +900,12 @@ def main(argv=None) -> int:
                 emit({"files": len(results), "results": results, "database": archive.stats()})
                 return 2 if any(r.get("error") or r.get("status") in {"failed", "error", "invalid"} for r in results) else 0
             if args.command == "collect":
-                return run_collect(args, archive)
+                from parser.quark_cloud import CloudUploadWorker
+                cloud_worker = CloudUploadWorker(db_path).start()
+                try:
+                    return run_collect(args, archive)
+                finally:
+                    cloud_worker.close()
             if args.command == "status":
                 from parser.report_semantics import semantic_stats
                 emit({"database": archive.stats(), "semantics": semantic_stats(archive.connection),

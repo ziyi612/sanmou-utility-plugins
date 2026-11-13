@@ -85,9 +85,9 @@ class BattleData:
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             if _BASE_TABLES - actual:
                 raise BattleDataError("该文件不是已初始化的战报数据库；请先启动采集。")
-            from parser.report_archive import SCHEMA_VERSION
+            from parser.report_archive import SUPPORTED_SCHEMA_VERSIONS
             version = connection.execute("SELECT value FROM report_meta WHERE key='schema_version'").fetchone()
-            if not version or version[0] != str(SCHEMA_VERSION):
+            if not version or version[0] not in SUPPORTED_SCHEMA_VERSIONS:
                 raise BattleDataError("数据库结构版本与当前程序不兼容，请使用匹配版本的程序。")
             # Keep each browser operation internally consistent while the
             # independent collector commits new snapshots in WAL mode.
@@ -117,8 +117,15 @@ class BattleData:
         row = connection.execute(
             "SELECT status,error FROM report_semantic_runs WHERE snapshot_id=? AND version=?",
             (snapshot_id, active[0])).fetchone()
-        return {"available": True, "version": active[0], "status": row[0] if row else "pending",
-                "error": row[1] if row else None}
+        result = {"available": True, "version": active[0], "status": row[0] if row else "pending",
+                  "error": row[1] if row else None}
+        if "report_semantic_event_modes" in names:
+            mode = connection.execute(
+                "SELECT event_mode FROM report_semantic_event_modes WHERE snapshot_id=? AND version=?",
+                (snapshot_id, active[0])).fetchone()
+            if mode:
+                result["event_storage"] = mode[0]
+        return result
 
     @staticmethod
     def _metadata(connection: sqlite3.Connection, snapshot_id: int) -> dict:
@@ -257,6 +264,13 @@ class BattleData:
                 components.setdefault(name, {"name": name, "name_zh": title, "available": False,
                                             "complete": None, "requested": None, "error": None, "status": {}})
             semantics = self._semantics(connection, snapshot_id)
+            if "event_storage" not in semantics:
+                columns = {column[1] for column in connection.execute("PRAGMA table_info(report_snapshots)")}
+                if "storage_mode" in columns:
+                    mode = connection.execute(
+                        "SELECT storage_mode FROM report_snapshots WHERE id=?", (snapshot_id,)).fetchone()
+                    if mode and mode[0] in ("compact", "lean"):
+                        semantics["event_storage"] = "on_demand"
             meanings = {}
             if semantics["status"] == "ready":
                 meaning_rows = list(connection.execute(
@@ -322,6 +336,23 @@ class BattleData:
                 event["parameters"] = _json_preview(event.pop("parameters_json"))
                 event["status"] = event["status"] or "not_generated"
                 events.append(event)
+            # Compact archives retain every raw event but generate Chinese
+            # event explanations only for the page being viewed. No semantic
+            # writes are allowed on this read-only browser connection.
+            if semantics.get("event_storage") == "on_demand":
+                missing = [event for event in events if event["status"] == "not_generated"]
+                if missing:
+                    try:
+                        from parser.report_semantics import decode_events_on_demand
+                        decoded = decode_events_on_demand(connection, snapshot_id, missing)
+                        semantics["on_demand_version"] = decoded["version"]
+                        if decoded.get("error"):
+                            semantics["on_demand_error"] = decoded["error"]
+                        meanings_by_sequence = {item["sequence"]: item for item in decoded["events"]}
+                        for event in missing:
+                            event.update(meanings_by_sequence.get(event["sequence"], {}))
+                    except Exception as exc:
+                        semantics["on_demand_error"] = f"{type(exc).__name__}: {exc}"
             return {"report": report, "components": components,
                     "missing_components": [name for name in COMPONENT_NAMES if
                         not components[name]["available"] or components[name]["complete"] is not True
@@ -335,6 +366,11 @@ class BattleData:
     def original_preview(self, snapshot_id: int, max_bytes: int = 24000) -> dict:
         snapshot_id = _integer(snapshot_id, "snapshot_id", 1, 2**63 - 1)
         max_bytes = _integer(max_bytes, "max_bytes", 100, 100000)
+        from parser.report_archive import ReportArchive
+        # A cache miss may download an original. Do it outside the UI's fixed
+        # SQLite read transaction and keep the existing bounded preview size.
+        with ReportArchive(self.db_path, read_only=True) as archive:
+            raw = archive.original_bytes(snapshot_id)
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT f.byte_count,f.sha256,substr(f.raw_bytes,1,?) preview "
@@ -342,7 +378,6 @@ class BattleData:
                 (max_bytes + 1, snapshot_id)).fetchone()
             if row is None:
                 raise KeyError(snapshot_id)
-            raw = bytes(row["preview"])
             return {"text": raw[:max_bytes].decode("utf-8-sig", "replace"),
                     "bytes": row["byte_count"], "sha256": row["sha256"],
                     "truncated": row["byte_count"] > max_bytes,

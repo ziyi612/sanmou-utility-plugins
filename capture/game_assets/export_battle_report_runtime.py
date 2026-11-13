@@ -555,7 +555,7 @@ def _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, ex
     payload["componentStatus"] = statuses
     if expected_identity is not None:
         payload["runtimeIdentity"] = expected_identity
-    raw = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     path = out_dir / "captures" / str(battle_id) / (hashlib.sha256(raw).hexdigest() + ".json")
     if not path.exists():
         atomic_bytes(path, raw)
@@ -886,7 +886,7 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
                 handle.write(previous)
                 handle.flush()
                 os.fsync(handle.fileno())
-    atomic_json(path, payload)
+    atomic_json(path, payload, compact=True)
     return {"battleID": battle_id, "exported": True, "complete": complete, "path": str(path),
             "eventCount": payload.get("eventCount"), "componentStatus": payload["componentStatus"],
             "serializationIssues": issues, "warnings": payload["captureWarnings"],
