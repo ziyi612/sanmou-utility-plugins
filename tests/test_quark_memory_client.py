@@ -273,6 +273,80 @@ def test_audited_quark_reset_with_sdk_timeout_wrapper_retries_at_most_three(memo
     assert memory_client.last_audit["physical_writes"] == []
 
 
+def audited_bridge_timeout():
+    response = audited_timeout(message="Request timeout after 60000ms: POST https://open-api-drive.quark.cn/open/v1/file/upload_pre?access_token=[redacted]")
+    value = json.loads(response.stdout)
+    record = value["audit"]["network"][0]
+    record.pop("error_code")
+    record["endpoint"] = "upload-pre"
+    record["lifecycle"] = [{"phase": name} for name in ["helper-spawned", "opening", "request-started", "timeout", "destroyed", "helper-exit"]]
+    response.stdout = json.dumps(value)
+    return response
+
+
+@pytest.mark.parametrize("succeed_on_third", [True, False])
+@pytest.mark.parametrize("host", ["open-api-drive.quark.cn", "dl-sz.open-drive.quark.cn"])
+def test_audited_bridge_timeout_phase_retries_the_identical_upload_at_most_three(memory_client, monkeypatch, succeed_on_third, host):
+    requests, delays = [], []
+    def run(command, **kwargs):
+        requests.append((command, json.loads(kwargs["input"])))
+        if succeed_on_third and len(requests) == 3:
+            return fake_envelope(ok=True, data={"fids": ["fixture"], "successCount": 1})
+        response = audited_bridge_timeout()
+        value = json.loads(response.stdout)
+        value["audit"]["network"][0]["hostname"] = host
+        response.stdout = json.dumps(value)
+        return response
+    monkeypatch.setattr(memory_module.subprocess, "run", run)
+    monkeypatch.setattr(memory_module.time, "sleep", delays.append)
+    raw = b"immutable synthetic report\0" * 8
+    if succeed_on_third:
+        assert memory_client.upload_bytes(raw, "same.gz") == {"fid": "fixture", "size": len(raw)}
+    else:
+        with pytest.raises(CloudError, match="Request timeout"):
+            memory_client.upload_bytes(raw, "same.gz")
+    assert len(requests) == 3 and requests[0] == requests[1] == requests[2]
+    assert delays == [1, 2] and memory_client.last_audit["transport_attempts"] == 3
+    assert base64.b64decode(requests[0][1]["body_base64"]) == raw
+    assert memory_client.last_audit["physical_writes"] == []
+
+
+@pytest.mark.parametrize("change", ["unknown-phase", "fake-host", "missing-audit", "bad-physical-audit", "permission",
+    "certificate-code", "certificate-metadata", "certificate-message", "unknown-message"])
+def test_bridge_timeout_phase_never_overrides_hard_refusals_or_untrusted_evidence(memory_client, monkeypatch, change):
+    response = audited_bridge_timeout()
+    value = json.loads(response.stdout)
+    record = value["audit"]["network"][0]
+    if change == "unknown-phase":
+        next(item for item in record["lifecycle"] if item["phase"] == "timeout")["phase"] = "timed-out"
+    elif change == "fake-host":
+        record["hostname"] = "open-api-drive.quark.cn.attacker.invalid"
+    elif change == "missing-audit":
+        value["audit"].pop("report_disk_writes")
+    elif change == "bad-physical-audit":
+        value["audit"]["physical_writes"] = [{"account_configuration_only": False}]
+    elif change == "permission":
+        value["result"]["code"] = 403
+    elif change == "certificate-code":
+        record["error_code"] = "TLS_VERIFICATION_FAILED"
+    elif change == "certificate-metadata":
+        record["lifecycle"].insert(2, {"phase": "transport-error", "ssl_error_class": "SSLCertVerificationError"})
+    elif change == "certificate-message":
+        value["result"]["msg"] += " certificate verification failed"
+    elif change == "unknown-message":
+        value["result"]["msg"] = "Unknown failure"
+    response.stdout = json.dumps(value)
+    calls, delays = [], []
+    def run(*_args, **_kwargs):
+        calls.append(1)
+        return response
+    monkeypatch.setattr(memory_module.subprocess, "run", run)
+    monkeypatch.setattr(memory_module.time, "sleep", delays.append)
+    with pytest.raises(CloudError):
+        memory_client.upload_bytes(b"fixture", "same.gz")
+    assert calls == [1] and delays == []
+
+
 @pytest.mark.parametrize("change", ["permission", "authorization-code", "configuration", "size", "missing-audit", "bad-physical-audit",
     "unknown-error", "malformed-error", "missing-network", "telemetry", "lookalike-host", "unknown-message"])
 def test_timeout_network_evidence_does_not_override_hard_refusals_or_unknown_audit(memory_client, monkeypatch, change):

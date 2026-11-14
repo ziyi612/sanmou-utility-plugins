@@ -30,16 +30,27 @@ def _is_transient_transport(message, result, audit=None):
     if result.get("code") in {-103, -104, -118, -1408, 400, 401, 403, 404, 422, 10001, 11001, 23018, 31001, 32003, 32004}:
         return False
     lower = message.lower()
-    if any(word in lower for word in ("permission", "forbidden", "unauthorized", "access denied", "configuration", "invalid config", "size limit", "too large", "memory limit", "audit", "权限", "未授权", "签名", "配置", "空间不足", "大小限制", "内存限制")):
+    if any(word in lower for word in ("permission", "forbidden", "unauthorized", "access denied", "configuration", "invalid config", "size limit", "too large", "memory limit", "audit", "tls_verification_failed", "certificate_verify_failed", "certificate verify failed", "certificate verification", "权限", "未授权", "签名", "配置", "空间不足", "大小限制", "内存限制", "证书")):
         return False
+    network = audit.get("network") if isinstance(audit, dict) else None
+    if isinstance(network, list):
+        for item in network:
+            if not isinstance(item, dict):
+                continue
+            lifecycle = item.get("lifecycle")
+            if item.get("error_code") == "TLS_VERIFICATION_FAILED" or (isinstance(lifecycle, list) and any(
+                isinstance(value, dict) and (value.get("error_code") == "TLS_VERIFICATION_FAILED"
+                    or value.get("ssl_error_class") == "SSLCertVerificationError"
+                    or value.get("ssl_reason") == "CERTIFICATE_VERIFY_FAILED") for value in lifecycle)):
+                return False
     if _TRANSPORT_ERROR.search(message) is not None:
         return True
     # The SDK can replace a concrete socket failure with its timeout wrapper.
-    # Only its known wrapper plus an audited Quark HTTPS transport error may
-    # enter the existing bounded retry; telemetry and unknown failures cannot.
+    # Its bridge timeout phase is also explicit ETIMEDOUT evidence when the
+    # SDK destroys the request before an error event can be recorded. Only the
+    # known wrapper plus audited Quark HTTPS evidence enters bounded retry.
     if _SDK_TIMEOUT.search(message) is None or not isinstance(audit, dict):
         return False
-    network = audit.get("network")
     if not isinstance(network, list):
         return False
     return any(isinstance(item, dict)
@@ -47,8 +58,9 @@ def _is_transient_transport(message, result, audit=None):
         and item.get("port") == 443
         and isinstance(item.get("hostname"), str)
         and (item["hostname"] == "open-api-drive.quark.cn" or item["hostname"].endswith(".open-drive.quark.cn"))
-        and isinstance(item.get("error_code"), str)
-        and item["error_code"] in _TRANSPORT_CODES for item in network)
+        and ((isinstance(item.get("error_code"), str) and item["error_code"] in _TRANSPORT_CODES)
+            or (isinstance(item.get("lifecycle"), list) and any(isinstance(value, dict)
+                and value.get("phase") == "timeout" for value in item["lifecycle"]))) for item in network)
 
 
 @contextmanager
