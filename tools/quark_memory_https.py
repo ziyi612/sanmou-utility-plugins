@@ -9,7 +9,9 @@ from __future__ import annotations
 import base64
 import errno
 import http.client
+import ipaddress
 import json
+import re
 import socket
 import ssl
 import sys
@@ -19,6 +21,11 @@ import urllib.request
 
 MAX_BYTES = 64 * 1024 * 1024
 MAX_ENVELOPE = MAX_BYTES * 4 // 3 + 2 * 1024 * 1024
+SSL_ERROR_CLASSES = frozenset({"SSLError", "SSLEOFError", "SSLSyscallError", "SSLZeroReturnError",
+    "SSLWantReadError", "SSLWantWriteError", "SSLCertVerificationError"})
+SSL_MNEMONIC = re.compile(r"[A-Z0-9_]{1,96}\Z", re.ASCII)
+SSL_OPERATIONS = {"do_handshake": "handshake", "read": "read", "recv": "read", "recv_into": "read",
+    "write": "write", "send": "write", "sendall": "write"}
 
 
 def phase(name, **values):
@@ -28,6 +35,24 @@ def phase(name, **values):
         value = values.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_ENVELOPE:
             record[key] = value
+    if name == "transport-error":
+        value = values.get("error_code")
+        if isinstance(value, str) and re.fullmatch(r"[A-Z0-9_]{1,64}", value, flags=re.ASCII):
+            record["error_code"] = value
+        value = values.get("ssl_error_class")
+        if isinstance(value, str) and value in SSL_ERROR_CLASSES:
+            record["ssl_error_class"] = value
+        for key in ("ssl_library", "ssl_reason"):
+            value = values.get(key)
+            if isinstance(value, str) and SSL_MNEMONIC.fullmatch(value):
+                record[key] = value
+        for key in ("ssl_errno", "verify_code"):
+            value = values.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and -(2**31) <= value < 2**31:
+                record[key] = value
+        value = values.get("ssl_operation")
+        if isinstance(value, str) and value in {"handshake", "read", "write"}:
+            record["ssl_operation"] = value
     sys.stderr.write(json.dumps(record, separators=(",", ":")) + "\n")
     sys.stderr.flush()
 
@@ -51,12 +76,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class VerifiedHTTPS(urllib.request.HTTPSHandler):
     """Keep explicit SDK header values, including Connection, unchanged."""
 
-    def __init__(self, context):
+    def __init__(self, context, connect_address=None):
         super().__init__(context=context)
         self.context = context
+        self.connect_address = connect_address
 
     def https_open(self, request):
         connection = http.client.HTTPSConnection(request.host, timeout=request.timeout, context=self.context)
+        if self.connect_address is not None:
+            # Replace only the TCP destination. HTTPSConnection retains its
+            # original host for Host, SNI and certificate hostname validation.
+            selected_address = self.connect_address
+            connection._create_connection = lambda address, *args, **kwargs: socket.create_connection(
+                (selected_address, address[1]), *args, **kwargs)
         headers = getattr(request, "_quark_headers", request.header_items())
         names = {name.lower() for name, _ in headers}
         body = request.data
@@ -101,10 +133,42 @@ def category(error):
     return "NETWORK_ERROR"
 
 
+def tls_metadata(error):
+    """Extract structured TLS identifiers, never exception text or frame data."""
+    for _ in range(8):
+        if not isinstance(error, urllib.error.URLError):
+            break
+        error = error.reason
+    if not isinstance(error, ssl.SSLError):
+        return {}
+    values = {"ssl_error_class": type(error).__name__,
+              "ssl_library": getattr(error, "library", None), "ssl_reason": getattr(error, "reason", None),
+              "ssl_errno": getattr(error, "errno", None), "verify_code": getattr(error, "verify_code", None)}
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if frame.f_globals.get("__name__") == "ssl":
+            operation = SSL_OPERATIONS.get(frame.f_code.co_name)
+            if operation is not None:
+                values["ssl_operation"] = operation
+        trace = trace.tb_next
+    return values
+
+
 def exchange(source):
     url = source.get("url")
     if not isinstance(url, str) or not allowed(url):
         return {"transport_error": "ENDPOINT_NOT_ALLOWED"}
+    connect_address = source.get("connect_address")
+    if connect_address is not None:
+        try:
+            address = ipaddress.ip_address(connect_address) if isinstance(connect_address, str) else None
+            host = urllib.parse.urlsplit(url).hostname or ""
+            if (not host.endswith(".open-drive.quark.cn") or not isinstance(address, ipaddress.IPv4Address)
+                or not address.is_global or address.is_multicast or address.is_reserved):
+                return {"transport_error": "CONNECT_ADDRESS_NOT_ALLOWED"}
+        except ValueError:
+            return {"transport_error": "CONNECT_ADDRESS_NOT_ALLOWED"}
     method = source.get("method", "GET")
     if method not in {"GET", "POST", "PUT", "HEAD", "DELETE", "PATCH", "OPTIONS"}:
         return {"transport_error": "METHOD_NOT_ALLOWED"}
@@ -123,7 +187,7 @@ def exchange(source):
         context = ssl.create_default_context()
         # Do not inherit a proxy behind the official SDK's back. The selected
         # transport targets precisely the allowlisted HTTPS host directly.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(), VerifiedHTTPS(context))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(), VerifiedHTTPS(context, connect_address))
         opener.addheaders = []
         body = payload if source.get("has_body", False) or payload else None
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -156,6 +220,7 @@ def exchange(source):
             if connection is not None:
                 connection.close()
     except Exception as error:
+        phase("transport-error", error_code=category(error), **tls_metadata(error))
         return {"transport_error": category(error)}
 
 

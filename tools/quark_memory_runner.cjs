@@ -112,7 +112,7 @@ function observedRequest(moduleProtocol, delegate, receiver, args) {
     if (record && typeof request?.on === 'function') request.on(errorMonitor, error => { record.error_code = networkErrorCode(error); });
     if (record && typeof request?.on === 'function') request.on('quark-memory-https-phase', value => {
       record.lifecycle ||= [];
-      if (record.lifecycle.length < 16) record.lifecycle.push(value);
+      if (record.lifecycle.length < 48) record.lifecycle.push(value);
     });
     return request;
   } catch (error) {

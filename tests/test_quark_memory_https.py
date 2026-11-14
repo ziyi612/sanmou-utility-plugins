@@ -128,6 +128,59 @@ def test_python_errors_never_include_urls_headers_or_exception_text(monkeypatch)
     assert secret not in json.dumps(result)
 
 
+@pytest.mark.parametrize("function,operation", [("do_handshake", "handshake"), ("read", "read"), ("write", "write")])
+def test_tls_error_metadata_is_structured_and_classification_is_unchanged(monkeypatch, capsys, function, operation):
+    scope = namespace()
+    secret = "fixture-private-credential://sensitive/path"
+    error = ssl.SSLError(1, secret)
+    error.library = "SSL"
+    error.reason = "WRONG_VERSION_NUMBER"
+    error.verify_code = 18
+    frame_scope = {"__name__": "ssl", "error": error}
+    exec(compile(f"def {function}():\n raise error\n", secret, "exec"), frame_scope)
+    def broken(*_a, **_k):
+        try:
+            frame_scope[function]()
+        except ssl.SSLError as error:
+            raise urllib.error.URLError(error)
+    monkeypatch.setattr(scope["urllib"].request, "build_opener", lambda *_a: SimpleNamespace(open=broken))
+    assert scope["exchange"]({"url": "https://open-api-drive.quark.cn/a?token=" + secret}) == {"transport_error": "EPROTO"}
+    output = capsys.readouterr().err
+    metadata = next(json.loads(line) for line in output.splitlines() if json.loads(line)["phase"] == "transport-error")
+    assert metadata == {"kind": "quark-https-phase", "phase": "transport-error", "error_code": "EPROTO",
+        "ssl_error_class": "SSLError", "ssl_library": "SSL", "ssl_reason": "WRONG_VERSION_NUMBER",
+        "ssl_errno": 1, "verify_code": 18, "ssl_operation": operation}
+    assert secret not in output
+
+
+def test_tls_metadata_rejects_free_text_nonstandard_classes_and_invalid_integer_values(capsys):
+    scope = namespace()
+    secret = "fixture-private-credential://sensitive/path"
+    scope["phase"]("transport-error", error_code="EPROTO", ssl_error_class=secret, ssl_library=secret,
+        ssl_reason=secret, ssl_errno=True, verify_code=2**40, ssl_operation=secret, path=secret, body=secret,
+        traceback=secret, verify_message=secret)
+    assert json.loads(capsys.readouterr().err) == {
+        "kind": "quark-https-phase", "phase": "transport-error", "error_code": "EPROTO"}
+    scope["phase"]("transport-error", ssl_error_class=[], ssl_operation=[])
+    assert json.loads(capsys.readouterr().err) == {"kind": "quark-https-phase", "phase": "transport-error"}
+
+
+def test_real_in_memory_tls_handshake_reports_only_ssl_identifiers(capsys):
+    scope = namespace()
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client = ssl.create_default_context().wrap_bio(incoming, outgoing, server_side=False, server_hostname="synthetic.invalid")
+    incoming.write(b"HTTP/1.1 502 Synthetic\r\nContent-Length: 0\r\n\r\n")
+    with pytest.raises(ssl.SSLError) as failure:
+        client.do_handshake()
+    assert scope["category"](failure.value) == "EPROTO"
+    scope["phase"]("transport-error", error_code="EPROTO", **scope["tls_metadata"](failure.value))
+    metadata = json.loads(capsys.readouterr().err)
+    assert metadata["ssl_error_class"] == "SSLError" and metadata["ssl_operation"] == "handshake"
+    assert metadata["ssl_library"] == "SSL" and metadata["ssl_reason"] == "WRONG_VERSION_NUMBER"
+    assert metadata["ssl_errno"] == 1
+    assert "synthetic.invalid" not in json.dumps(metadata)
+
+
 def test_node_bridge_is_opt_in_allowlisted_and_preserves_request_response_pipes(tmp_path):
     node = shutil.which("node")
     if node is None: pytest.skip("Node is optional")
@@ -148,6 +201,12 @@ child.spawn=function(python,args,options){
     worker.stderr.emit('data',Buffer.from(JSON.stringify({kind:'quark-https-phase',phase:'response-headers',status:206,
      content_length:3,path:'secret/path',headers:'private-headers',body:'private-body',url:'private-url'})+'\n'));
     worker.stderr.emit('data',Buffer.from(JSON.stringify({kind:'quark-https-phase',phase:'arbitrary-secret-phase'})+'\n'));
+    worker.stderr.emit('data',Buffer.from(JSON.stringify({kind:'quark-https-phase',phase:'transport-error',
+     error_code:'EPROTO',ssl_error_class:'SSLEOFError',ssl_library:'SSL',ssl_reason:'UNEXPECTED_EOF_WHILE_READING',
+     ssl_errno:8,verify_code:18,ssl_operation:'read',strerror:'private-text',traceback:'secret-path'})+'\n'));
+    worker.stderr.emit('data',Buffer.from(JSON.stringify({kind:'quark-https-phase',phase:'transport-error',
+     ssl_error_class:'secret-class',ssl_library:'private-url',ssl_reason:'private-url',ssl_errno:true,
+     verify_code:1099511627776,ssl_operation:'private-phase'})+'\n'));
     worker.stdout.emit('data',Buffer.from(JSON.stringify({status:206,status_message:'Partial Content',headers:[['X-Original','kept'],['set-cookie','one'],['set-cookie','two']],body_base64:Buffer.from([0,255,9]).toString('base64')})));
     worker.emit('close',0);
   }); };
@@ -173,6 +232,10 @@ promise.then(()=>{
  assert.equal(submitted.method,'POST');assert.deepEqual(submitted.headers,headers);assert.deepEqual(Buffer.from(submitted.body_base64,'base64'),Buffer.from([0,254,7,8]));
  assert.equal(JSON.stringify(options),original);assert.equal(spawnCalls,1);
  assert.deepEqual(phases.find(value=>value.phase==='response-headers'),{phase:'response-headers',status:206,content_length:3});
+ assert.deepEqual(phases.filter(value=>value.phase==='transport-error'),[
+  {phase:'transport-error',error_code:'EPROTO',ssl_error_class:'SSLEOFError',ssl_library:'SSL',
+   ssl_reason:'UNEXPECTED_EOF_WHILE_READING',ssl_errno:8,verify_code:18,ssl_operation:'read'},
+  {phase:'transport-error'}]);
  assert(!JSON.stringify(phases).includes('private'));assert(!JSON.stringify(phases).includes('secret'));
  for(const options of [{hostname:'example.invalid',port:443,path:'/a'}, {hostname:'open-api-drive.quark.cn',port:80,path:'/a'}, {hostname:'open-api-drive.quark.cn',protocol:'http:',path:'/a'}, {hostname:'open-api-drive.quark.cn.evil.invalid',path:'/a'}]) https.request(options);
  assert.equal(nativeCalls,4);assert.equal(spawnCalls,1);console.log('RAM_HTTPS_CONTRACT_OK');
