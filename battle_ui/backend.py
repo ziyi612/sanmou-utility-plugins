@@ -25,6 +25,10 @@ import uuid
 
 import psutil
 
+# The standalone stop helper runs with battle_ui as sys.path[0]. It never uses
+# these settings, so keep its imports independent from the project packages.
+TIME_RANGES = ("all", "24h", "72h", "7d")
+
 if __package__:
     from .capture_timing import LastCaptureTimingReader
 else:
@@ -80,12 +84,13 @@ def _collection_options(args: list[str]) -> dict[str, Any] | None:
         scopes = list(dict.fromkeys(item.strip() for item in value("--scope", ",".join(SCOPES)).split(",") if item.strip()))
         interval = float(value("--interval", "60"))
         parallel = int(value("--parallel", "1"))
+        time_range = value("--time-range", "all")
         if not scopes or any(item not in SCOPES for item in scopes) or not math.isfinite(interval) or interval <= 0:
             return None
-        if not 1 <= parallel <= 4:
+        if not 1 <= parallel <= 4 or time_range not in TIME_RANGES:
             return None
         result = {"scopes": scopes, "interval": int(interval) if interval.is_integer() else interval,
-                  "pvp_only": "--pvp-only" in args, "parallel": parallel}
+                  "pvp_only": "--pvp-only" in args, "parallel": parallel, "time_range": time_range}
         manual_pid = value("--pid", "")
         if manual_pid:
             pid = int(manual_pid)
@@ -385,6 +390,11 @@ class Controller:
                 last_error = last_error or f"采集程序已退出（代码 {code}），请查看运行日志。"
         same_output = bool(process and _path_key(process["out_dir"]) == _path_key(self.out_dir))
         last_capture = self._capture_for_status(raw, process, matches)
+        collection_options = dict(process["collection_options"]) if process and process.get("collection_options") else None
+        # New CLI workers can use their default without an explicit flag. Their
+        # verified status distinguishes them from old all-time workers.
+        if collection_options is not None and matches and raw.get("time_range") in TIME_RANGES:
+            collection_options["time_range"] = raw["time_range"]
         result = {
             "running": running, "owned": owned, "external": bool(running and not owned),
             "pid": process["pid"] if process else None, "phase": phase,
@@ -405,7 +415,7 @@ class Controller:
             "stopping": self._stopping is not None,
             "status_stale": status_stale, "other_collectors": len(candidates),
             "raw_status": raw if matches else {},
-            "collection_options": process.get("collection_options") if process else None,
+            "collection_options": collection_options,
         }
         key = json.dumps({name: result[name] for name in ("running", "pid", "phase", "last_error", "current_battle_id", "last_progress_at", "namespace", "last_capture")}, sort_keys=True)
         if key != self._last_state_key:
@@ -435,6 +445,9 @@ class Controller:
         pvp_only = options.get("pvp_only", False)
         if not isinstance(pvp_only, bool):
             raise ValueError("仅采集 PVP 选项必须为勾选或未勾选。")
+        time_range = options.get("time_range", "24h")
+        if not isinstance(time_range, str) or time_range not in TIME_RANGES:
+            raise ValueError("下载时段必须为全时段、最近24小时、最近72小时或最近7天。")
         namespace = options.get("namespace", "auto")
         if not isinstance(namespace, str) or not namespace.strip():
             raise ValueError("账号命名空间不能为空。")
@@ -449,7 +462,8 @@ class Controller:
             self._log_path = self.log_dir / name
             command = [str(self.python_executable), "-B", "-u", str(self.entry), "collect", "--console",
                        "--db", str(self.db_path), "--out-dir", str(self.out_dir), "--namespace", namespace,
-                       "--scope", ",".join(scopes), "--interval", str(interval), "--parallel", str(parallel)]
+                       "--scope", ",".join(scopes), "--interval", str(interval), "--parallel", str(parallel),
+                       "--time-range", time_range]
             if pvp_only:
                 command.append("--pvp-only")
             if pid is not None:

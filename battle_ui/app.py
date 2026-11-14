@@ -18,6 +18,8 @@ from tkinter import filedialog, font, ttk
 from typing import Any
 
 from .winrate_sorting import MIN_KNOWN_RESULTS, known_result_count, ranked_winrate_rows
+from .collection_settings import save_time_range
+from capture.game_assets.collection_window import DEFAULT_TIME_RANGE, TIME_RANGE_HOURS, TIME_RANGE_LABELS
 
 
 BG = "#f3f5f9"
@@ -78,13 +80,15 @@ def format_last_capture(value: Any, namespace: str | None = None) -> str:
     return f"{approximate}{elapsed} · {outcome} · 战报 {str(battle_id).strip()}"
 
 
-def format_cycle_coverage(value: Any, pvp_only: bool) -> str | None:
+def format_cycle_coverage(value: Any, pvp_only: bool, time_range: str = "all") -> str | None:
     """Describe only an observed cycle, never all historical archive records."""
     if not isinstance(value, dict):
         return None
     filtering = value.get("filter")
     mode = "pvp_only" if pvp_only else "all"
     if not isinstance(filtering, dict) or filtering.get("mode") != mode:
+        return None
+    if filtering.get("timeRange", "all") != time_range or time_range not in TIME_RANGE_HOURS:
         return None
     total, complete, finished = (value.get(key) for key in
                                  ("visibleReports", "completeVisibleReports", "finishedAt"))
@@ -102,7 +106,10 @@ def format_cycle_coverage(value: Any, pvp_only: bool) -> str | None:
     unknown = filtering.get("unknownReports", 0)
     if isinstance(unknown, int) and not isinstance(unknown, bool) and unknown > 0:
         checked += f"，类型待确认 {unknown:,} 封"
-    return (f"{scope} · 完整 {complete:,} / {total:,} 封 · {checked}"
+    time_unknown = filtering.get("timeUnknownReports", 0)
+    if isinstance(time_unknown, int) and not isinstance(time_unknown, bool) and time_unknown > 0:
+        checked += f"，时间待确认 {time_unknown:,} 封"
+    return (f"{scope} · {TIME_RANGE_LABELS[time_range]} · 完整 {complete:,} / {total:,} 封 · {checked}"
             f" · {format_time(finished)}（最近一轮，不含被筛选的历史记录）")
 
 
@@ -122,16 +129,66 @@ def pretty(value: Any, limit: int = 100_000) -> str:
     return text
 
 
+class _MemoryCloudPanel(tk.Frame):
+    def __init__(self, parent, *, data, submit):
+        super().__init__(parent, bg=BG)
+        self.data, self.submit = data, submit
+        self.note = tk.StringVar(value="严格云端模式：战报原文、目录和续采状态保存在夸克，查看时只进入运行内存。")
+        ttk.Button(self, text="读取云端状态", command=self.refresh).pack(anchor="w", pady=(0, 15))
+        tk.Label(self, textvariable=self.note, bg=BG, fg=TEXT, justify="left", anchor="w",
+                 wraplength=840).pack(fill="x", pady=(0, 15))
+        self.output = tk.Text(self, wrap="word", state="disabled", relief="flat", padx=14, pady=14)
+        self.output.pack(fill="both", expand=True)
+
+    def refresh(self):
+        self.note.set("正在联网读取云端目录和状态……")
+
+        def operation():
+            from parser.quark_cloud import public_result
+            try:
+                return self.data.cloud_status()
+            except Exception as error:
+                return {"error": str(public_result(str(error))), "available": False}
+
+        self.submit("cloud-status", operation, self.render, replace=False)
+
+    def render(self, result):
+        from parser.quark_cloud import public_result
+        self.note.set("云端暂不可读取：" + str(result["error"]) if result.get("error") else
+                      "已读取云端状态。本机不保存战报数据库、原文文件或磁盘缓存。")
+        self.output.configure(state="normal")
+        self.output.delete("1.0", "end")
+        if result.get("error"):
+            text = "云端读取未完成。\n" + str(public_result(str(result["error"])))
+        else:
+            text = (f"可查询战报：{int(result.get('reports', 0)):,} 封\n"
+                    f"云端归档记录：{int(result.get('files', 0)):,} 项\n\n"
+                    "新战报写入本地：关闭\n本模式磁盘缓存：关闭\n"
+                    "原文、目录与续采状态：保存在夸克\n"
+                    "查看方式：联网读取到运行内存，关闭后释放\n\n"
+                    "已提供：档案列表、筛选、详情和事件翻页。\n"
+                    "此模式暂不提供整库统计，也不允许导出战报到本地。")
+        self.output.insert("end", text)
+        self.output.configure(state="disabled")
+
+
 class BattleApp(tk.Tk):
     """Tk stays on its own thread; all process/database work uses workers."""
 
     def __init__(self, root_path: Path, controller: Any, data: Any, *, interval: int = 60,
                  game_pid: int | None = None, daily_service=None, opponent_service=None,
                  peerless_service=None, team_winrate_service=None,
-                 pvp_only: bool = True, parallelism: int = 1):
+                 pvp_only: bool = True, parallelism: int = 1,
+                 time_range: str = DEFAULT_TIME_RANGE, settings_path: Path | None = None):
+        if time_range not in TIME_RANGE_HOURS:
+            raise ValueError("Unknown download time range")
         super().__init__()
         self.root_path = Path(root_path)
         self.controller, self.data = controller, data
+        self.memory_only = bool(getattr(data, "memory_only", False))
+        self.settings_path = Path(settings_path) if settings_path is not None else None
+        self._preferred_time_range = time_range
+        self._active_time_range_display = False
         if daily_service is None and hasattr(data, "db_path"):
             from .daily import DailyStats
             daily_service = DailyStats(data.db_path, own_union_only=True,
@@ -197,6 +254,7 @@ class BattleApp(tk.Tk):
         self.interval_var = tk.StringVar(value=str(interval))
         self.pid_var = tk.StringVar(value=str(game_pid) if game_pid is not None else "")
         self.parallel_var = tk.StringVar(value=str(parallelism))
+        self.time_range_var = tk.StringVar(value=TIME_RANGE_LABELS[time_range])
         self.pvp_only_var = tk.BooleanVar(value=pvp_only)
         self.collection_mode_var = tk.StringVar(value="仅采集 PVP；PVE 和类型待确认的战报不下载正文。"
                                                if pvp_only else "采集全部类型，包含 PVP 和 PVE。")
@@ -242,6 +300,9 @@ class BattleApp(tk.Tk):
         self.metric_vars = {key: tk.StringVar(value="—") for key in ("total", "complete", "partial", "ratio")}
         self._style()
         self._build()
+        if self.memory_only:
+            self.parallel_var.set("1")
+            self.parallel_box.configure(values=("1",), state="disabled")
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Control-r>", lambda _: self.refresh())
         self._initial_refresh_id = self.after(100, self.refresh)
@@ -290,7 +351,9 @@ class BattleApp(tk.Tk):
                                font=("Microsoft YaHei UI", 11))
             button.pack(fill="x", padx=10, pady=3)
             self.nav_buttons[key] = button
-        tk.Label(sidebar, text="保留原有数据库\n断点续采 · 原文去重", bg=NAVY, fg="#a4b6ca",
+            if self.memory_only and key not in self.data.supported_pages:
+                button.configure(state="disabled", cursor="arrow")
+        tk.Label(sidebar, text=("云端战报 · 仅运行内存\n全库统计暂不提供" if self.memory_only else "保留原有数据库\n断点续采 · 原文去重"), bg=NAVY, fg="#a4b6ca",
                  justify="left", font=("Microsoft YaHei UI", 9), wraplength=150).pack(side="bottom", anchor="w", padx=24, pady=25)
         content = tk.Frame(shell, bg=BG)
         content.pack(side="left", fill="both", expand=True, padx=24, pady=(22, 12))
@@ -322,7 +385,7 @@ class BattleApp(tk.Tk):
         self.message_label = tk.Label(footer, textvariable=self.message_var, bg=BG, fg=MUTED,
                                       anchor="w", width=1, font=("Microsoft YaHei UI", 9))
         self.message_label.pack(side="left", fill="x", expand=True)
-        tk.Label(footer, text="关闭界面后采集继续；用“停止采集”结束", bg=BG, fg=MUTED,
+        tk.Label(footer, text=("关闭界面会请求停止；等待当前云端校验完成" if self.memory_only else "关闭界面后采集继续；用“停止采集”结束"), bg=BG, fg=MUTED,
                  font=("Microsoft YaHei UI", 9)).pack(side="right", before=self.message_label)
         self.show_page("overview", load=False)
 
@@ -335,7 +398,7 @@ class BattleApp(tk.Tk):
     def _build_overview(self):
         page = self._page_frame("overview")
         cards = tk.Frame(page, bg=BG)
-        cards.pack(fill="x", pady=(0, 17))
+        cards.pack(fill="x", pady=(0, 10))
         for i, (key, caption, color) in enumerate((("total", "已发现战报", TEXT), ("complete", "组件完整", TEAL),
                                                   ("partial", "档案待补齐", AMBER), ("ratio", "已发现战报完整率", BLUE))):
             cards.columnconfigure(i, weight=1, uniform="metric")
@@ -347,12 +410,20 @@ class BattleApp(tk.Tk):
         panel = tk.Frame(page, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         panel.pack(fill="x")
         panel.columnconfigure(1, weight=1)
-        tk.Label(panel, text="持续采集", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 14, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(17, 8))
+        heading_controls = tk.Frame(panel, bg=PANEL)
+        heading_controls.grid(row=0, column=0, sticky="w", padx=20, pady=(12, 6))
+        tk.Label(heading_controls, text="持续采集", bg=PANEL, fg=TEXT,
+                 font=("Microsoft YaHei UI", 14, "bold")).pack(side="left")
+        tk.Label(heading_controls, text="下载时段", bg=PANEL, fg=MUTED).pack(side="left", padx=(20, 8))
+        self.time_range_box = ttk.Combobox(heading_controls, textvariable=self.time_range_var,
+            values=tuple(TIME_RANGE_LABELS.values()), state="readonly", width=16)
+        self.time_range_box.pack(side="left")
+        self.time_range_box.bind("<<ComboboxSelected>>", self._time_range_changed)
         self.phase_label = tk.Label(panel, textvariable=self.phase_var, bg="#eef3fb", fg=BLUE,
                                     padx=13, pady=5, font=("Microsoft YaHei UI", 10, "bold"))
-        self.phase_label.grid(row=0, column=1, sticky="e", padx=20, pady=(17, 8))
+        self.phase_label.grid(row=0, column=1, sticky="e", padx=20, pady=(12, 6))
         controls = tk.Frame(panel, bg=PANEL)
-        controls.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 14))
+        controls.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(2, 10))
         self.scope_checks = []
         for key, label in (("personal", "个人"), ("union", "同盟"), ("star", "收藏")):
             check = ttk.Checkbutton(controls, text=label, variable=self.scopes[key])
@@ -366,7 +437,7 @@ class BattleApp(tk.Tk):
         self.pid_box = ttk.Entry(controls, textvariable=self.pid_var, width=8)
         self.pid_box.pack(side="left")
         actions = tk.Frame(panel, bg=PANEL)
-        actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 17))
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 12))
         self.start_button = ttk.Button(actions, text="开始采集", style="Primary.TButton", command=self.start_collection)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(actions, text="停止采集", style="Stop.TButton", command=self.stop_collection, state="disabled")
@@ -382,23 +453,23 @@ class BattleApp(tk.Tk):
         for row, label, var in ((3, "当前战报", self.current_var),
                                 (4, "上一封采集用时", self.last_capture_var),
                                 (5, "最近进度", self.progress_var)):
-            tk.Label(panel, text=label, bg=PANEL, fg=MUTED).grid(row=row, column=0, sticky="w", padx=20, pady=7)
-            tk.Label(panel, textvariable=var, bg=PANEL, fg=TEXT, anchor="w", wraplength=760).grid(row=row, column=1, sticky="ew", padx=20, pady=7)
+            tk.Label(panel, text=label, bg=PANEL, fg=MUTED).grid(row=row, column=0, sticky="w", padx=20, pady=5)
+            tk.Label(panel, textvariable=var, bg=PANEL, fg=TEXT, anchor="w", wraplength=760).grid(row=row, column=1, sticky="ew", padx=20, pady=5)
         self.error_label = tk.Label(panel, textvariable=self.error_var, bg="#fff1f0", fg=RED,
                                     justify="left", anchor="w", wraplength=850, padx=12, pady=8)
         self.error_label.grid(row=6, column=0, columnspan=2, sticky="ew", padx=20, pady=(5, 13))
         self.error_label.grid_remove()
         tk.Label(panel, textvariable=self.collection_mode_var, bg=PANEL, fg=MUTED,
-                 anchor="w", font=("Microsoft YaHei UI", 9)).grid(row=7, column=0, columnspan=2, sticky="ew", padx=20, pady=(3, 14))
+                 anchor="w", wraplength=850, justify="left", font=("Microsoft YaHei UI", 9)).grid(row=7, column=0, columnspan=2, sticky="ew", padx=20, pady=(2, 8))
         tk.Label(panel, textvariable=self.scope_coverage_var, bg=PANEL, fg=TEXT,
                  anchor="w", justify="left", wraplength=850,
-                 font=("Microsoft YaHei UI", 9)).grid(row=8, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 14))
+                 font=("Microsoft YaHei UI", 9)).grid(row=8, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 9))
         bottom = tk.Frame(page, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
-        bottom.pack(fill="x", pady=(17, 0))
-        tk.Label(bottom, text="档案完整度", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 8))
+        bottom.pack(fill="x", pady=(10, 0))
+        tk.Label(bottom, text="档案完整度", bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=20, pady=(10, 6))
         self.coverage_bar = ttk.Progressbar(bottom, style="Coverage.Horizontal.TProgressbar", maximum=100)
         self.coverage_bar.pack(fill="x", padx=20)
-        tk.Label(bottom, textvariable=self.coverage_var, bg=PANEL, fg=MUTED, anchor="w").pack(fill="x", padx=20, pady=(9, 14))
+        tk.Label(bottom, textvariable=self.coverage_var, bg=PANEL, fg=MUTED, anchor="w").pack(fill="x", padx=20, pady=(6, 10))
         tk.Label(page, text="完整率针对库中所有已发现战报；PVP 筛选只限制后续下载，历史档案保留。",
                  bg=BG, fg=MUTED, anchor="w", wraplength=950, font=("Microsoft YaHei UI", 9)).pack(fill="x", pady=(12, 0))
 
@@ -474,10 +545,15 @@ class BattleApp(tk.Tk):
         self.raw_text = self._text(raw, mono=True)
         self.export_button = ttk.Button(right, text="导出完整原文…", command=self.export_selected, state="disabled")
         self.export_button.pack(side="bottom", fill="x", pady=(10, 0), before=tabs)
-        tk.Label(page, text="每封只展示当前最完整版本；事件按页读取，导出原文包含所有字段。", bg=BG,
+        tk.Label(page, text=("每封展示云端当前最完整版本；事件按页读取，本机不保存战报或导出文件。" if self.memory_only else "每封只展示当前最完整版本；事件按页读取，导出原文包含所有字段。"), bg=BG,
                  fg=MUTED, anchor="w", font=("Microsoft YaHei UI", 9)).pack(side="bottom", fill="x", pady=(8, 0), before=panes)
 
     def _build_cloud(self):
+        if self.memory_only:
+            page = self._page_frame("cloud")
+            self.cloud_panel = _MemoryCloudPanel(page, data=self.data, submit=self._submit)
+            self.cloud_panel.pack(fill="both", expand=True)
+            return
         from .cloud_panel import CloudPanel
         page = self._page_frame("cloud")
         self.cloud_panel = CloudPanel(page, root_path=self.root_path,
@@ -490,10 +566,11 @@ class BattleApp(tk.Tk):
         bar = tk.Frame(page, bg=BG)
         bar.pack(fill="x", pady=(0, 12))
         tk.Label(bar, text="采集输出和连接错误", bg=BG, fg=TEXT, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        ttk.Button(bar, text="打开日志目录", command=self.open_logs).pack(side="right")
+        ttk.Button(bar, text="打开日志目录", command=self.open_logs,
+                   state="disabled" if self.memory_only else "normal").pack(side="right")
         ttk.Button(bar, text="清空显示", command=lambda: self._set_text(self.log_text, "")).pack(side="right", padx=8)
         self.log_text = self._text(page, mono=True)
-        tk.Label(page, text="清空只影响窗口显示，磁盘日志保留。旧运行状态不会作为当前正在采集的证明。",
+        tk.Label(page, text=("运行记录仅保存在当前窗口内存，关闭后释放；不创建战报磁盘日志。" if self.memory_only else "清空只影响窗口显示，磁盘日志保留。旧运行状态不会作为当前正在采集的证明。"),
                  bg=BG, fg=MUTED, anchor="w", font=("Microsoft YaHei UI", 9)).pack(fill="x", pady=(8, 0))
 
     def _small_metrics(self, parent, definitions, variables):
@@ -806,7 +883,7 @@ class BattleApp(tk.Tk):
             controller = self.controller
             self._submit("runtime", lambda: BattleApp._read_runtime(controller), self._render_runtime)
         if time.monotonic() >= self._next_overview:
-            self._next_overview = time.monotonic() + 15
+            self._next_overview = time.monotonic() + (60 if self.memory_only else 15)
             self._submit("overview", self.data.overview, self._render_overview)
         self._poll_id = self.after(500, self._poll)
 
@@ -834,25 +911,38 @@ class BattleApp(tk.Tk):
             self._options_pid = state.get("pid")
         elif not running:
             self._options_pid = None
+            if self._active_time_range_display:
+                self.time_range_var.set(TIME_RANGE_LABELS[self._preferred_time_range])
+                self._active_time_range_display = False
+        if running:
+            # A verified status may arrive after process discovery and correct
+            # the inferred default without changing this worker's PID.
+            active_range = (state.get("collection_options") or {}).get("time_range", "all")
+            self.time_range_var.set(TIME_RANGE_LABELS.get(active_range, TIME_RANGE_LABELS["all"]))
+            self._active_time_range_display = True
         self.phase_var.set(state.get("status") or ("正在采集" if running else "未启动"))
         self.phase_label.configure(fg=TEAL if running and not stopping else BLUE)
         self.start_button.configure(state="normal" if state.get("can_start", not running) and "start" not in self._inflight else "disabled")
         self.stop_button.configure(state="normal" if state.get("can_stop", running) and not stopping else "disabled")
         for widget in [*self.scope_checks, self.interval_box, self.pid_box, self.pvp_only_check]:
             widget.configure(state="disabled" if running or stopping else "normal")
-        self.parallel_box.configure(state="disabled" if running or stopping else "readonly")
+        self.parallel_box.configure(state="disabled" if self.memory_only or running or stopping else "readonly")
+        if self.memory_only:
+            self.parallel_var.set("1")
+        self.time_range_box.configure(state="disabled" if running or stopping else "readonly")
         self._collection_mode_changed()
         filtering = state.get("raw_status", {}).get("filter") or {}
         if running and self.pvp_only_var.get() and "pveReports" in filtering:
             self.collection_mode_var.set(
                 f"仅采集 PVP · 本轮列表排除非 PVP {filtering.get('pveReports', 0)} 封"
-                f" · 类型待确认 {filtering.get('unknownReports', 0)} 封")
-        context = (state.get("namespace"), self.pvp_only_var.get())
+                f" · 类型待确认 {filtering.get('unknownReports', 0)} 封；按战斗发生时间滚动筛选。")
+        time_range = self._selected_time_range()
+        context = (state.get("namespace"), self.pvp_only_var.get(), time_range)
         if context != self._scope_coverage_context:
             self._scope_coverage_context = context
             self._scope_coverage_text = None
         raw = state.get("raw_status") or {}
-        text = format_cycle_coverage(raw.get("result"), self.pvp_only_var.get())
+        text = format_cycle_coverage(raw.get("result"), self.pvp_only_var.get(), time_range)
         if text and raw.get("namespace") == state.get("namespace") and state.get("namespace"):
             self._scope_coverage_text = text
         self.scope_coverage_var.set(self._scope_coverage_text or "等待当前采集范围的一轮结果……")
@@ -884,6 +974,9 @@ class BattleApp(tk.Tk):
         self.log_text.configure(state="disabled")
 
     def show_page(self, page, *, load=True):
+        if self.memory_only and page not in self.data.supported_pages:
+            self._message("严格云端模式提供档案、筛选及详情；跨全历史统计暂不提供。")
+            page = "archive"
         self._page = page
         self.pages[page].tkraise()
         names = {"overview": ("采集总览", "采集当前登录角色；上方账号筛选仅用于查看已有档案。"),
@@ -894,6 +987,11 @@ class BattleApp(tk.Tk):
                  "peerless": ("无双记录", "记录任一玩家打出无双的那次战报，按次保留当事人信息。"),
                  "cloud": ("夸克云端", "完整原文压缩上传，查看和导出时自动读取缓存或云端。"),
                  "logs": ("运行记录", "连接、采集和入库错误会在这里显示。")}
+        if self.memory_only:
+            names.update(overview=("云端采集总览", "战报自动上传夸克；本机仅在运行内存中处理，断网时无法读取新内容。"),
+                         archive=("云端战报档案", "联网读取云端目录和所选原文；不保存本地数据库、缓存或导出。"),
+                         cloud=("夸克云端", "原文和目录保存在夸克；每次读取校验后仅进入运行内存。"),
+                         logs=("运行记录", "状态和诊断仅保存在当前窗口内存，关闭后释放。"))
         self.title_var.set(names[page][0])
         self.subtitle_var.set(names[page][1])
         for key, button in self.nav_buttons.items():
@@ -912,7 +1010,7 @@ class BattleApp(tk.Tk):
             self.cloud_panel.refresh()
 
     def refresh(self):
-        self._next_overview = time.monotonic() + 15
+        self._next_overview = time.monotonic() + (60 if self.memory_only else 15)
         self._submit("overview", self.data.overview, self._render_overview)
         if self._page == "cloud":
             self.cloud_panel.refresh()
@@ -1663,8 +1761,28 @@ class BattleApp(tk.Tk):
         self.coverage_var.set(f"已发现 {total:,} 封，其中 {complete:,} 封五组件完整，{partial:,} 封等待补齐" + (f"，另有 {legacy:,} 封历史格式。" if legacy else "。"))
 
     def _collection_mode_changed(self):
-        self.collection_mode_var.set("仅采集 PVP；PVE 和类型待确认的战报不下载正文。"
-                                     if self.pvp_only_var.get() else "采集全部类型，包含 PVP 和 PVE。")
+        mode = "仅采集 PVP；PVE 和类型待确认的战报不下载正文。" if self.pvp_only_var.get() else "采集全部类型，包含 PVP 和 PVE。"
+        self.collection_mode_var.set(mode + " 按战斗发生时间筛选，持续采集时自动滚动更新。")
+
+    def _selected_time_range(self):
+        label = self.time_range_var.get()
+        for value, candidate in TIME_RANGE_LABELS.items():
+            if label == candidate:
+                return value
+        raise ValueError("请选择有效的下载时段。")
+
+    def _time_range_changed(self, _=None):
+        try:
+            selected = self._selected_time_range()
+            if self.settings_path is not None:
+                save_time_range(self.settings_path, selected)
+        except (OSError, ValueError) as error:
+            self._message(f"下载时段未能保存：{error}", True)
+            return
+        self._preferred_time_range = selected
+        self._scope_coverage_text = None
+        self.scope_coverage_var.set("等待当前采集范围的一轮结果……")
+        self._message(f"下载时段已选择：{TIME_RANGE_LABELS[selected]}。")
 
     def start_collection(self):
         scopes = [key for key, var in self.scopes.items() if var.get()]
@@ -1674,6 +1792,7 @@ class BattleApp(tk.Tk):
                 interval = int(interval)
             pid = int(self.pid_var.get()) if self.pid_var.get().strip() else None
             parallel = int(self.parallel_var.get())
+            time_range = self._selected_time_range()
             if not scopes or not 5 <= interval <= 3600:
                 raise ValueError
             if pid is not None and pid <= 0:
@@ -1684,15 +1803,15 @@ class BattleApp(tk.Tk):
             self._message("请至少选择一个战报范围；间隔填 5 至 3600，并行数填 1 至 4，游戏进程 ID 留空或填正整数。", True)
             return
         self.start_button.configure(state="disabled")
-        self._message("正在启动采集，沿用已有数据库和续采进度……")
+        self._message("正在启动云端采集，联网读取云端续采进度……" if self.memory_only else "正在启动采集，沿用已有数据库和续采进度……")
         options = {"scopes": scopes, "interval": interval, "pid": pid,
-                   "pvp_only": self.pvp_only_var.get(), "parallel": parallel}
+                   "pvp_only": self.pvp_only_var.get(), "parallel": parallel, "time_range": time_range}
         controller = self.controller
         self._submit("start", lambda: controller.start(options), lambda _: self._message("采集已启动，正在连接游戏。"))
 
     def stop_collection(self):
         self.stop_button.configure(state="disabled")
-        self._message("正在保存已有数据并停止采集，请等待当前操作退出……")
+        self._message("正在完成当前云端上传和校验后停止，请等待……" if self.memory_only else "正在保存已有数据并停止采集，请等待当前操作退出……")
         self._submit("stop", self.controller.request_stop, lambda _: None)
 
     def reset_filter(self):
@@ -1782,7 +1901,7 @@ class BattleApp(tk.Tk):
         self._detail = result
         report = result.get("report", {})
         self.detail_title.set(f"战报 {report.get('battle_uid', self._selected.get('battle_uid') if self._selected else '')}\n{COMPLETENESS.get(report.get('completeness'), '待核实')} · {int(report.get('event_count', 0)):,} 条事件")
-        self.export_button.configure(state="normal")
+        self.export_button.configure(state="disabled" if not getattr(self.data, "allow_export", True) else "normal")
         components = result.get("components", {})
         for key, widget in self.component_labels.items():
             item = components.get(key, {})
@@ -1820,7 +1939,7 @@ class BattleApp(tk.Tk):
                 semantic_note += "\n本页实际字典版本：" + version[:12] + ("…" if len(version) > 12 else "")
         else:
             semantic_note = "中文解释：" + ("已有解释，未知项保留原值。" if sem.get("available") and sem.get("status") == "ready" else "该版本解释尚未就绪，原始数据可查。")
-        lines += [semantic_note, "", "本页只读查看；导出原文包含全部字段。"]
+        lines += [semantic_note, "", ("本页只在运行内存中查看，严格云端模式禁止本地导出。" if self.memory_only else "本页只读查看；导出原文包含全部字段。")]
         self._set_text(self.info_text, "\n".join(lines))
         events = result.get("events", [])
         parts = []
@@ -1839,8 +1958,11 @@ class BattleApp(tk.Tk):
         self.event_page_var.set(f"{self._event_offset+1 if events else 0}–{self._event_offset+len(events)} / {total}")
         self.event_prev.configure(state="normal" if self._event_offset else "disabled")
         self.event_next.configure(state="normal" if result.get("event_has_more") else "disabled")
-        self._set_text(self.raw_text, pretty(result))
-        self._message("详情已读取；事件按页展示，原文导出不截断。")
+        raw_preview = pretty(result)
+        if self.memory_only:
+            raw_preview = raw_preview.replace("导出原文可查看全部数据。", "完整原文保留在云端；本机不创建导出文件。")
+        self._set_text(self.raw_text, raw_preview)
+        self._message("详情已从云端读取；本页仅在运行内存中展示，事件可翻页。" if self.memory_only else "详情已读取；事件按页展示，原文导出不截断。")
 
     def change_events(self, direction):
         if not self._selected or (direction > 0 and not (self._detail or {}).get("event_has_more")):
@@ -1849,6 +1971,9 @@ class BattleApp(tk.Tk):
         self._load_detail()
 
     def export_selected(self):
+        if not getattr(self.data, "allow_export", True):
+            self._message("严格云端模式不允许导出战报到本地文件。", True)
+            return
         if not self._selected:
             return
         selected = dict(self._selected)
@@ -1865,6 +1990,9 @@ class BattleApp(tk.Tk):
                      lambda _: self._message(f"完整原文已导出：{target}"))
 
     def open_logs(self):
+        if self.memory_only:
+            self._message("运行记录只保存在当前窗口内存，不创建磁盘日志。")
+            return
         path = Path(self._runtime.get("log_path") or self.root_path / "logs")
         folder = path if path.is_dir() else path.parent
         if os.name == "nt":

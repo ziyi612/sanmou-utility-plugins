@@ -17,12 +17,35 @@ import time
 import uuid
 
 from capture.game_assets.atomic_files import replace_with_retry
+from capture.game_assets.collection_window import DEFAULT_TIME_RANGE, TIME_RANGE_HOURS, validate_time_range
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "data/database/battle_reports.db"
 DEFAULT_REPORTS = ROOT / "capture/output/processed/battle_reports"
 DEFAULT_CAPTURE = ROOT / "data/incoming/runtime"
 DEFAULT_MIN_FREE_GIB = 5.0
+
+
+def memory_mode_enabled(config_path=None):
+    """A persistent setting must never silently fall back to disk collection."""
+    marker = ROOT / "config/launcher.json"
+    settings = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
+    if not isinstance(settings, dict):
+        raise ValueError("启动配置格式无效，已拒绝回退到本地战报保存。")
+    strict = settings.get("storage_backend") == "quark-memory"
+    from parser.quark_cloud import DEFAULT_CONFIG
+    paths = {Path(DEFAULT_CONFIG), Path(os.environ.get("SANMOU_QUARK_CONFIG", DEFAULT_CONFIG))}
+    if config_path is not None:
+        paths.add(Path(config_path))
+    for current in paths:
+        if current.is_file():
+            config = json.loads(current.read_text(encoding="utf-8"))
+            if not isinstance(config, dict):
+                raise ValueError("夸克配置格式无效，已拒绝回退到本地战报保存。")
+            strict = strict or config.get("storage_backend") == "quark-memory"
+    if not marker.is_file() and not strict:
+        raise ValueError("启动配置缺失，已拒绝本地采集；请先运行 tools/setup_quark.py --memory-only。")
+    return strict
 
 
 class CollectionStorageLimit(KeyboardInterrupt):
@@ -141,10 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="战报全字段归档：采集、入库、查询和完整性核验")
     sub = parser.add_subparsers(dest="command", required=True)
     cloud = sub.add_parser("cloud", help="连接夸克、同步压缩原文和查看缓存状态")
-    cloud.add_argument("action", choices=("status", "login", "init", "sync", "compact"))
+    cloud.add_argument("action", choices=("status", "login", "init", "sync", "compact", "migrate"))
     cloud.add_argument("--db", type=Path, default=DEFAULT_DB)
     cloud.add_argument("--config", type=Path)
     cloud.add_argument("--limit", type=int, default=10)
+    cloud.add_argument("--root", type=Path, default=ROOT, help="历史迁移的现有项目根目录")
+    cloud.add_argument("--source", type=Path, action="append", help="明确选择迁移目录或单文件；可重复指定")
+    cloud.add_argument("--delete-local", action="store_true", help="仅在整批上传、回读和目录校验成功后清理本地原件")
     for name, help_text in [("import", "导入原始战报 JSON"), ("collect", "持续采集个人、同盟和收藏战报"),
                             ("status", "查看数据库计数和战报列表"), ("verify", "逐字段核对数据库与原文件"),
                             ("export", "按快照 ID 导出原始文件"), ("query", "只读 SQL 查询"),
@@ -174,10 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="同时预取的战报上限；Lua调用仍在同一游戏线程执行")
             p.add_argument("--pvp-only", action="store_true",
                            help="只请求当前客户端明确标为PVP的战报正文；跳过PVE和未知类型")
+            p.add_argument("--time-range", choices=tuple(TIME_RANGE_HOURS), default=DEFAULT_TIME_RANGE,
+                           help="按战斗发生时间选择 all/24h/72h/7d；默认最近24小时，持续采集使用滚动时段")
             p.add_argument("--max-pages", type=int, default=10000)
             p.add_argument("--max-cycles", type=int)
             p.add_argument("--once", action="store_true")
-            p.add_argument("--console", action="store_true", help="显示简明采集进度，完整状态仍写入文件")
+            p.add_argument("--console", action="store_true", help="显示简明采集进度；纯云端模式仅通过管道返回状态")
             p.add_argument("--battle-ids", nargs="+", help="只采集明确列出的ID；完整度仅针对这些ID")
         elif name == "status":
             p.add_argument("--limit", type=int, default=20)
@@ -221,7 +249,7 @@ def normalize_identity(value: object) -> dict[str, str]:
 
 
 def read_identity(runner) -> dict:
-    from export_battle_report_runtime import LUA_JSON, decode_envelope, run_checked
+    from capture.game_assets.export_battle_report_runtime import LUA_JSON, decode_envelope, run_checked
     code = LUA_JSON + """
 local cp = ClientProxy
 if not cp or cp.avatarId == nil or type(cp.GetServerId) ~= 'function' then
@@ -308,6 +336,9 @@ def run_collect(args, archive) -> int:
         raise ValueError("--max-cycles must be positive")
     if getattr(args, "pvp_only", False) and getattr(args, "battle_ids", None):
         raise ValueError("--pvp-only cannot be combined with --battle-ids: explicit IDs lack verified list matchType")
+    time_range = validate_time_range(getattr(args, "time_range", DEFAULT_TIME_RANGE))
+    if time_range != "all" and getattr(args, "battle_ids", None):
+        raise ValueError("--battle-ids requires --time-range all: explicit IDs lack verified list battle timestamps")
     out_dir = output_path(args.out_dir)
     storage = CollectionStorageGuard((output_path(args.db).parent, out_dir),
                                      getattr(args, "min_free_gib", DEFAULT_MIN_FREE_GIB))
@@ -360,10 +391,10 @@ def run_collect(args, archive) -> int:
         status_context.update(value)
         # Progress is event-driven, not inferred from a process merely existing.
         known = {"namespace": active_namespace, **runtime_context,
-                 "pvp_only": bool(getattr(args, "pvp_only", False))}
+                 "pvp_only": bool(getattr(args, "pvp_only", False)), "time_range": time_range}
         result_filter = value.get("result", {}).get("filter") if isinstance(value.get("result"), dict) else None
         known["filter"] = result_filter if isinstance(result_filter, dict) else {
-            "mode": "pvp_only" if known["pvp_only"] else "all"}
+            "mode": "pvp_only" if known["pvp_only"] else "all", "timeRange": time_range}
         if active_identity is not None:
             known["identity"] = active_identity
         atomic_json(status_path, {**known, **progress_state, **status_context, "pid": os.getpid()})
@@ -643,6 +674,7 @@ def run_collect(args, archive) -> int:
                                 parallelism=getattr(args, "parallel", 1),
                                 owner_id=owner_id,
                                 pvp_only=bool(getattr(args, "pvp_only", False)),
+                                time_range=time_range,
                             )
                             result = collector.run_cycle()
                     last_failed = bool(result.get("errors")) or result.get("complete") is not True or bool(recovery_errors)
@@ -811,9 +843,9 @@ def explain_report(archive, battle_id: str, namespace: str | None = None, limit:
 
 def main(argv=None) -> int:
     # Set these before importing libraries that create temporary/cache files.
-    temp = output_path(os.environ.get("SANMOU_TEMP_DIR", str(ROOT / ".runtime" / "temp")))
+    temp = output_path(os.environ.get("SANMOU_TEMP_DIR", str(ROOT / ".runtime/temp")))
     temp.mkdir(parents=True, exist_ok=True)
-    os.environ["TEMP"] = os.environ["TMP"] = str(temp)
+    os.environ["TEMP"] = os.environ["TMP"] = os.environ["TMPDIR"] = str(temp)
     sys.dont_write_bytecode = True
     args = build_parser().parse_args(argv)
     try:
@@ -827,21 +859,62 @@ def main(argv=None) -> int:
             if not args.namespace.strip():
                 raise ValueError("Namespace must not be empty")
         db_path = output_path(args.db)
+        # Branch before opening SQLite, creating status files or attaching the
+        # legacy disk logger. The program setting itself contains no reports.
+        memory_mode = memory_mode_enabled(getattr(args, "config", None))
+        if memory_mode and args.command == "collect":
+            from capture.game_assets.cloud_collect import run_memory_collect
+            return run_memory_collect(args)
+        if memory_mode and args.command != "cloud":
+            if args.command not in {"status", "verify"}:
+                raise ValueError("仅内存模式支持云端采集、档案查询和核验；本地SQL、导入、导出及持久中文回填已停用。")
+            if args.command == "verify" and args.out:
+                raise ValueError("仅内存模式不把战报核验结果写入本地文件。")
+            from parser.cloud_store import CloudStore
+            store = CloudStore()
+            store.refresh()
+            if args.command == "status":
+                emit(store.status())
+                return 0
+            if args.command == "verify":
+                count = 0
+                for key in store.catalog["files"]:
+                    for _ in store.iter_file(key):
+                        pass
+                    count += 1
+                emit({"ok": True, "files_checked": count, "backend": "quark-memory"})
+                return 0
         if args.command == "cloud":
             from parser.quark_cloud import (cloud_status, load_config, QuarkClient,
                                            initialize_folder, sync_archive, public_result, login_with_browser)
             if args.action == "status":
-                emit(cloud_status(db_path, args.config))
+                if memory_mode:
+                    from parser.cloud_store import CloudStore
+                    store = CloudStore(args.config)
+                    store.refresh()
+                    emit(store.status())
+                else:
+                    emit(cloud_status(db_path, args.config))
             elif args.action == "login":
                 emit(public_result(login_with_browser(load_config(args.config),
                     notify=lambda message: print(message, file=sys.stderr, flush=True))))
             elif args.action == "init":
                 emit(initialize_folder(args.config))
+            elif args.action == "migrate":
+                from parser.cloud_migration import migrate_local
+                from parser.cloud_store import CloudStore
+                result = migrate_local(CloudStore(args.config), args.root, roots=args.source or None,
+                    delete_after_verify=args.delete_local, progress=emit)
+                emit(result)
             elif args.action == "sync":
+                if memory_mode:
+                    raise ValueError("仅内存模式直接在采集时提交云端，没有待扫描的本地战报库。")
                 result = sync_archive(db_path, config_path=args.config, limit=args.limit)
                 emit(result)
                 return 2 if result["failed"] else 0
             elif args.action == "compact":
+                if memory_mode:
+                    raise ValueError("仅内存模式没有本地战报数据库可压缩。")
                 if not db_path.is_file():
                     raise FileNotFoundError(db_path)
                 with collector_lock(db_path.with_suffix(".collector.lock")):

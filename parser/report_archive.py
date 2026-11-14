@@ -320,18 +320,27 @@ def _quality(payload: dict, fields: list[tuple], data: dict) -> tuple[str, list,
 class ReportArchive:
     """Atomic, append-only raw archive with best-snapshot query projections."""
 
-    def __init__(self, db_path: str | Path, read_only: bool = False, semantic_mapper=None,
-                 storage_mode: str = "full"):
+    def __init__(self, db_path: str | Path | None = None, read_only: bool = False, semantic_mapper=None,
+                 storage_mode: str = "full", *, connection: sqlite3.Connection | None = None):
         if storage_mode not in STORAGE_MODES:
             raise ValueError(f"storage_mode must be one of {STORAGE_MODES}")
         self.storage_mode = storage_mode
         self.semantic_mapper = semantic_mapper
         self._semantic_archive = None
         self.read_only = read_only
-        self.db_path = Path(db_path).expanduser().resolve() if read_only else _write_path(db_path)
-        if read_only:
+        self.memory_only = connection is not None
+        if self.memory_only:
+            if any(row[2] for row in connection.execute("PRAGMA database_list")):
+                raise ValueError("An injected archive connection must be entirely in memory")
+            self.db_path = None
+            self.connection = connection
+        elif db_path is None:
+            raise ValueError("db_path is required for a disk archive")
+        elif read_only:
+            self.db_path = Path(db_path).expanduser().resolve()
             self.connection = sqlite3.connect(self.db_path.as_uri() + "?mode=ro", uri=True, timeout=30)
         else:
+            self.db_path = _write_path(db_path)
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self.connection = sqlite3.connect(str(self.db_path), timeout=30)
         self.connection.row_factory = sqlite3.Row
@@ -357,7 +366,7 @@ class ReportArchive:
             self.connection.execute("PRAGMA foreign_keys=ON")
             self.connection.execute("PRAGMA busy_timeout=30000")
             self.connection.execute("PRAGMA temp_store=MEMORY")
-            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA journal_mode=" + ("MEMORY" if self.memory_only else "WAL"))
             self.connection.executescript(_DDL)
             with self.connection:
                 # Additive metadata lets old full-index snapshots coexist with

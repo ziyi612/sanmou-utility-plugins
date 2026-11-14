@@ -15,14 +15,20 @@ try:
     from .atomic_files import replace_with_retry
     from .runtime_errors import RuntimeBridgeUnavailable, is_bridge_exception
     from . import runtime_response_audit as response_audit
+    from .memory_storage import verified_store
 except ImportError:
     from atomic_files import replace_with_retry
     from runtime_errors import RuntimeBridgeUnavailable, is_bridge_exception
     import runtime_response_audit as response_audit
+    from memory_storage import verified_store
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT_DIR = ROOT / "capture" / "output" / "processed" / "battle_reports"
 COMPONENTS = ("basic", "detail", "all", "statics", "snapshots")
+
+
+class BattleRequestFiltered(RuntimeError):
+    """A rolling download window expired before a component was dispatched."""
 
 
 def safe_output_path(value: str | Path) -> Path:
@@ -45,15 +51,17 @@ def validate_battle_id(value: Any) -> int:
     return number
 
 
-def atomic_bytes(path: Path, raw: bytes) -> None:
+def atomic_bytes(path: Path, raw: bytes, *, artifact_store=None) -> None:
     """Publish already encoded bytes without repeating JSON serialization.
 
     The complete temporary file is flushed before replacement. On replacement
     failure it and the previous destination are retained for recovery.
     """
-    path = safe_output_path(path)
     if not isinstance(raw, bytes):
         raise TypeError("atomic_bytes requires encoded bytes")
+    if artifact_store is not None:
+        return verified_store(artifact_store).write_bytes(Path(path), raw)
+    path = safe_output_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("wb") as handle:
@@ -63,13 +71,23 @@ def atomic_bytes(path: Path, raw: bytes) -> None:
     replace_with_retry(temporary, path)
 
 
-def atomic_json(path: Path, value: Any, *, compact: bool = False) -> None:
+def atomic_json(path: Path, value: Any, *, compact: bool = False, artifact_store=None) -> None:
+    if artifact_store is not None:
+        return verified_store(artifact_store).write_json(Path(path), value)
     path = safe_output_path(path)
     options = {"separators": (",", ":")} if compact else {"indent": 2}
     # json.dumps emits the same UTF-8/LF bytes as the old streaming json.dump,
     # but avoids a Python file-write call for every small encoder fragment.
     raw = json.dumps(value, ensure_ascii=False, allow_nan=False, **options).encode("utf-8")
     atomic_bytes(path, raw)
+
+
+def artifact_exists(path, artifact_store=None):
+    return artifact_store.exists(Path(path)) if artifact_store is not None else Path(path).exists()
+
+
+def artifact_bytes(path, artifact_store=None):
+    return artifact_store.read_bytes(Path(path)) if artifact_store is not None else Path(path).read_bytes()
 
 
 def identity_guard_lua(expected: dict[str, Any]) -> str:
@@ -406,6 +424,11 @@ def _dispatch_component(runner: Any, battle_id: int, component: str, *, rate_own
         if remaining <= 0:
             break
         time.sleep(remaining)
+    request_allowed = getattr(rate_owner, "battle_request_allowed", None)
+    if callable(request_allowed) and not request_allowed(battle_id):
+        # No slot was consumed and no RPC was sent. The caller still exports
+        # received caches and retained response fragments through its normal path.
+        raise BattleRequestFiltered("outside_selected_time_range")
     try:
         result = run_checked(runner, code, direct=direct)
         if audit_token is not None:
@@ -427,13 +450,14 @@ def _dispatch_component(runner: Any, battle_id: int, component: str, *, rate_own
 
 
 class _ComponentAudit:
-    def __init__(self, runner, battle_id: int, direct: bool):
+    def __init__(self, runner, battle_id: int, direct: bool, artifact_store=None):
         self.runner, self.cleanup_runner, self.battle_id, self.direct = runner, runner, battle_id, direct
         self.token, self.active = uuid.uuid4().hex, False
         self.out_dir = None
         self.expected_identity = None
         self.identity = None
         self.saved_paths = []
+        self.artifact_store = verified_store(artifact_store)
 
     def ensure(self):
         if self.active:
@@ -450,7 +474,7 @@ class _ComponentAudit:
             return
         if not isinstance(records, list) or self.out_dir is None:
             raise ValueError("Invalid retained response records")
-        tickets = []
+        tickets, artifacts = [], []
         identity = self.expected_identity or self.identity
         for record in records:
             if (not isinstance(record, dict) or str(record.get("battleID")) != str(self.battle_id)
@@ -485,13 +509,22 @@ class _ComponentAudit:
             # with the account currently supplied by a caller.
             raw = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
             path = self.out_dir / "captures" / str(self.battle_id) / (hashlib.sha256(raw).hexdigest() + ".json")
-            if path.exists():
-                if path.read_bytes() != raw:
-                    raise ValueError("Retained checkpoint hash path contains different bytes; originals remain pending")
-            else:
-                atomic_bytes(path, raw)
-            self.saved_paths.append(str(path))
+            artifacts.append((path, raw))
             tickets.append(record["ticket"])
+        # Stage the entire received batch before the first upload. The game
+        # may close while a network failure is being retried by the caller.
+        if self.artifact_store is not None:
+            for path, raw in artifacts:
+                self.artifact_store.stage_bytes(path, raw)
+        for path, raw in artifacts:
+            if artifact_exists(path, self.artifact_store):
+                if artifact_bytes(path, self.artifact_store) != raw:
+                    raise ValueError("Retained checkpoint hash path contains different bytes; originals remain pending")
+                if self.artifact_store is not None:
+                    self.artifact_store.discard_staged(path)
+            else:
+                atomic_bytes(path, raw, **({"artifact_store": self.artifact_store} if self.artifact_store is not None else {}))
+            self.saved_paths.append(str(path))
         # Only confirmed durable paths may release their Lua-side originals.
         run_checked(self.cleanup_runner, LUA_JSON + response_audit.acknowledge_lua(
             self.battle_id, identity, tickets, lua_string), direct=self.direct)
@@ -531,7 +564,7 @@ def _wait_observed(runner, battle_id, component, wait_seconds, poll_seconds, dir
         time.sleep(max(.01, min(poll_seconds, min(deadline, hard_deadline) - now)))
 
 
-def _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, expected_identity):
+def _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, expected_identity, artifact_store=None):
     envelope = decode_envelope(run_checked(runner, export_lua(battle_id, audit_token=token), timeout=45, direct=direct))
     payload = envelope["payload"]
     if str(payload.get("battleID")) != str(battle_id):
@@ -557,8 +590,8 @@ def _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, ex
         payload["runtimeIdentity"] = expected_identity
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     path = out_dir / "captures" / str(battle_id) / (hashlib.sha256(raw).hexdigest() + ".json")
-    if not path.exists():
-        atomic_bytes(path, raw)
+    if not artifact_exists(path, artifact_store):
+        atomic_bytes(path, raw, **({"artifact_store": artifact_store} if artifact_store is not None else {}))
     return str(path)
 
 
@@ -644,6 +677,8 @@ def prefetch_reports(runner: Any, battle_ids, wait_seconds: float = 20.0,
                 dispatched_at = _dispatch_component(runner, battle_id, name, rate_owner=rate_owner,
                                                     min_request_interval=method_gap, min_dispatch_interval=global_gap)
                 meta["deadline"] = dispatched_at + wait_seconds
+            except BattleRequestFiltered:
+                meta.update(requested=False, dispatched=False, skipReason="outside_selected_time_range")
             except RuntimeBridgeUnavailable:
                 raise
             except Exception as exc:
@@ -687,7 +722,7 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
                    wait_seconds: float = 20.0, poll_seconds: float = 0.5,
                    direct: bool = False, expected_identity: dict[str, Any] | None = None,
                    prefetched_requests: dict | None = None, request_missing: bool = True,
-                   _audit: _ComponentAudit | None = None) -> dict[str, Any]:
+                    _audit: _ComponentAudit | None = None, artifact_store=None) -> dict[str, Any]:
     """Retain partial data and expose component errors for bounded retries."""
     if not math.isfinite(wait_seconds) or wait_seconds < 0 or not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("wait/poll must be finite, with wait >= 0 and poll > 0")
@@ -695,7 +730,9 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
     prefetched = _validate_prefetched_requests(battle_id, prefetched_requests)
     if not isinstance(request_missing, bool):
         raise ValueError("request_missing must be a boolean")
-    out_dir = safe_output_path(out_dir)
+    artifact_store = verified_store(artifact_store)
+    out_dir = Path(out_dir) if artifact_store is not None else safe_output_path(out_dir)
+    artifact_options = {"artifact_store": artifact_store} if artifact_store is not None else {}
     rate_owner = runner if hasattr(runner, "__dict__") else SimpleNamespace()
     if expected_identity is not None:
         runner = IdentityGuardRunner(runner, expected_identity)
@@ -739,7 +776,7 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
             # No cache is modified or manufactured by the exporter.
             if status[name].get("partialAvailable") or (
                     name == "snapshots" and status[name].get("available") and not status[name].get("complete")):
-                checkpoint = _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, expected_identity)
+                checkpoint = _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, expected_identity, **artifact_options)
                 cache_checkpoints.append(checkpoint)
                 attempt["cache_checkpoint_path"] = checkpoint
             _dispatch_component(runner, battle_id, name, rate_owner=rate_owner,
@@ -751,7 +788,7 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
                 continue
             if token is not None and attempt.get("cache_suppressed") and attempt.get("dispatched") is False:
                 if not attempt.get("cache_checkpoint_path"):
-                    checkpoint = _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, expected_identity)
+                    checkpoint = _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, expected_identity, **artifact_options)
                     cache_checkpoints.append(checkpoint)
                     attempt["cache_checkpoint_path"] = checkpoint
                 ready, status = _wait_natural_expiry(runner, battle_id, name, wait_seconds, poll_seconds, direct, token)
@@ -764,7 +801,7 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
                 # More fragments may have arrived while the cache aged. Save
                 # those too immediately before its original RPC clears them.
                 if status[name].get("partialAvailable", status[name].get("available", False)):
-                    checkpoint = _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, expected_identity)
+                    checkpoint = _checkpoint_before_cache_retry(runner, battle_id, out_dir, direct, token, expected_identity, **artifact_options)
                     cache_checkpoints.append(checkpoint)
                     attempt["cache_checkpoint_path"] = checkpoint
                 first_attempt = dict(attempt)
@@ -785,6 +822,10 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
                 error = "timeout" if not ok else None
             if not ok:
                 requested[name]["error"] = error or "timeout"
+        except BattleRequestFiltered:
+            requested[name] = {**requested.get(name, prior or {}), "requested": False,
+                               "dispatched": False, "skipReason": "outside_selected_time_range"}
+            status = None
         except RuntimeBridgeUnavailable:
             raise
         except Exception as exc:
@@ -795,6 +836,15 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
     token = _audit.token if _audit is not None and _audit.active else None
     result = run_checked(runner, export_lua(battle_id, audit_token=token), timeout=45.0, direct=direct)
     envelope = None if result.startswith("not_found ") else decode_envelope(result)
+    received_checkpoint = None
+    if artifact_store is not None and envelope is not None and not envelope["payload"].get("notFound"):
+        received = dict(envelope["payload"])
+        received.update(captureKind="received_before_cloud_confirmation", captureComplete=False,
+                        serializationIssues=envelope.get("serializationIssues", []),
+                        luaTableKeyTypes=envelope.get("luaTableKeyTypes", {}))
+        received_raw = json.dumps(received, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        received_checkpoint = out_dir / "captures" / str(battle_id) / (hashlib.sha256(received_raw).hexdigest() + ".json")
+        artifact_store.stage_bytes(received_checkpoint, received_raw)
     if envelope is not None and _audit is not None:
         _audit.persist_retained(envelope.get("retainedRecords", []))
         cache_checkpoints.extend(_audit.saved_paths)
@@ -875,18 +925,24 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
     if expected_identity is not None:
         payload["runtimeIdentity"] = expected_identity
     path = out_dir / f"battle_{battle_id}_decrypted.json"
-    if path.exists():
-        previous = path.read_bytes()
+    if artifact_exists(path, artifact_store):
+        previous = artifact_bytes(path, artifact_store)
         previous_path = out_dir / "captures" / str(battle_id) / (hashlib.sha256(previous).hexdigest() + ".json")
-        previous_path.parent.mkdir(parents=True, exist_ok=True)
-        if not previous_path.exists():
+        if artifact_store is not None:
+            if not artifact_exists(previous_path, artifact_store):
+                atomic_bytes(previous_path, previous, **artifact_options)
+        else:
+            previous_path.parent.mkdir(parents=True, exist_ok=True)
+        if artifact_store is None and not previous_path.exists():
             # Preserve exact original bytes even if an earlier run never reached
             # database ingestion or used a different JSON layout.
             with previous_path.open("xb") as handle:
                 handle.write(previous)
                 handle.flush()
                 os.fsync(handle.fileno())
-    atomic_json(path, payload, compact=True)
+    atomic_json(path, payload, compact=True, **artifact_options)
+    if received_checkpoint is not None:
+        artifact_store.discard_staged(received_checkpoint)
     return {"battleID": battle_id, "exported": True, "complete": complete, "path": str(path),
             "eventCount": payload.get("eventCount"), "componentStatus": payload["componentStatus"],
             "serializationIssues": issues, "warnings": payload["captureWarnings"],
@@ -896,13 +952,16 @@ def _capture_report_impl(runner: Any, battle_id: int, out_dir: Path,
 def capture_report(runner: Any, battle_id: int, out_dir: Path,
                    wait_seconds: float = 20.0, poll_seconds: float = 0.5,
                    direct: bool = False, expected_identity: dict[str, Any] | None = None,
-                   prefetched_requests: dict | None = None, request_missing: bool = True) -> dict[str, Any]:
-    audit = _ComponentAudit(runner, battle_id, direct) if response_audit.supported(runner) else None
+                    prefetched_requests: dict | None = None, request_missing: bool = True,
+                    artifact_store=None) -> dict[str, Any]:
+    artifact_store = verified_store(artifact_store)
+    audit = _ComponentAudit(runner, battle_id, direct, artifact_store) if response_audit.supported(runner) else None
     primary = None
     result = None
     try:
         result = _capture_report_impl(runner, battle_id, out_dir, wait_seconds, poll_seconds,
-                                      direct, expected_identity, prefetched_requests, request_missing, audit)
+                                       direct, expected_identity, prefetched_requests, request_missing, audit,
+                                       artifact_store=artifact_store)
         return result
     except BaseException as exc:
         primary = exc
@@ -911,7 +970,7 @@ def capture_report(runner: Any, battle_id: int, out_dir: Path,
         if audit is not None:
             try:
                 audit.close()
-            except Exception as cleanup_error:
+            except BaseException as cleanup_error:
                 if primary is None:
                     raise
                 if hasattr(primary, "add_note"):

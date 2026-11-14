@@ -107,7 +107,7 @@ def case_start_stop_buttons_control_backend_without_blocking_tk(view):
     app.start_button.invoke()
     pump(app, lambda: controller.running)
     assert controller.started == [{"scopes": ["personal", "union", "star"], "interval": 60, "pid": None,
-                                   "pvp_only": True, "parallel": 2}]
+                                   "pvp_only": True, "parallel": 2, "time_range": "24h"}]
     pump(app, lambda: str(app.stop_button.cget("state")) == "normal")
     app.stop_button.invoke()
     pump(app, lambda: controller.stops == 1)

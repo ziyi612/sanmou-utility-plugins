@@ -114,18 +114,19 @@ def test_active_collection_options_follow_verified_cli_not_gui_defaults(work, mo
             "--scope=personal", "--interval=180", "--pid=12345"]
     signature = backend.collector_signature(FakeProcess(work, args), work, c.db_path)
     monkeypatch.setattr(c, "_find_collectors", lambda: [signature])
-    assert c.snapshot()["collection_options"] == {"scopes": ["personal"], "interval": 180, "pid": 12345, "pvp_only": False, "parallel": 1}
+    assert c.snapshot()["collection_options"] == {"scopes": ["personal"], "interval": 180, "pid": 12345, "pvp_only": False, "parallel": 1, "time_range": "all"}
     monkeypatch.setattr(c, "_find_collectors", lambda: [])
     assert c.snapshot()["collection_options"] is None
 
 
 def test_collection_options_support_separate_values_and_last_argparse_value(work):
     args = [sys.executable, "battle_reports.py", "collect", "--db", "test.db", "--scope", "personal",
-            "--interval", "10", "--scope=union,star", "--interval=180", "--parallel", "1", "--parallel=2"]
+            "--interval", "10", "--scope=union,star", "--interval=180", "--parallel", "1", "--parallel=2",
+            "--time-range", "24h", "--time-range=72h"]
     signature = backend.collector_signature(FakeProcess(work, args), work, work / "test.db")
-    assert signature["collection_options"] == {"scopes": ["union", "star"], "interval": 180, "pvp_only": False, "parallel": 2}
+    assert signature["collection_options"] == {"scopes": ["union", "star"], "interval": 180, "pvp_only": False, "parallel": 2, "time_range": "72h"}
     defaults = backend.collector_signature(FakeProcess(work), work, work / "test.db")
-    assert defaults["collection_options"] == {"scopes": ["personal", "union", "star"], "interval": 60, "pvp_only": False, "parallel": 1}
+    assert defaults["collection_options"] == {"scopes": ["personal", "union", "star"], "interval": 60, "pvp_only": False, "parallel": 1, "time_range": "all"}
 
 
 def test_unrelated_python_entry_cannot_spoof_collector_with_data_argument(work):
@@ -168,6 +169,16 @@ def timing_controller(work, monkeypatch):
     raw = {"running": True, "pid": 123, "at": "1970-01-01T00:03:20Z", "phase": "collecting",
            "namespace": TIMING_NAMESPACE, "current_battle_id": "next", "cycle": 1}
     return c, signature, raw
+
+
+def test_verified_status_reports_new_cli_default_and_ignores_stale_time_range(work, monkeypatch):
+    c, _, raw = timing_controller(work, monkeypatch)
+    raw["time_range"] = "24h"
+    write_timing_status(c, raw)
+    assert c.snapshot()["collection_options"]["time_range"] == "24h"
+    raw["pid"] = 999
+    write_timing_status(c, raw)
+    assert c.snapshot()["collection_options"]["time_range"] == "all"
 
 
 def capture_receipt(**updates):
@@ -279,6 +290,7 @@ def test_different_output_same_db_blocks_start_but_not_stopped_by_wrong_gui(work
     {"interval": True}, {"pid": 0}, {"pid": True}, {"parallel": 0}, {"parallel": 5},
     {"parallel": True}, {"parallel": "2"}, {"parallel": 2.5}, {"namespace": ""},
     {"pvp_only": "true"}, {"pvp_only": 1},
+    {"time_range": "30d"}, {"time_range": None}, {"time_range": True},
 ])
 def test_bad_options_never_spawn(work, monkeypatch, options):
     c = controller(work)
@@ -291,13 +303,15 @@ def test_bad_options_never_spawn(work, monkeypatch, options):
 
 def test_start_close_reopen_and_graceful_stop_real_isolated_worker(work):
     c = controller(work)
-    first = c.start({"scopes": ["personal", "star"], "interval": 60, "pvp_only": True, "parallel": 2})
+    first = c.start({"scopes": ["personal", "star"], "interval": 60, "pvp_only": True, "parallel": 2, "time_range": "72h"})
     assert first["owned"] and first["running"]
     assert first["collection_options"]["pvp_only"] is True
     assert "--pvp-only" in psutil.Process(first["pid"]).cmdline()
     worker_args = psutil.Process(first["pid"]).cmdline()
     assert worker_args[worker_args.index("--parallel") + 1] == "2"
     assert first["collection_options"]["parallel"] == 2
+    assert worker_args[worker_args.index("--time-range") + 1] == "72h"
+    assert first["collection_options"]["time_range"] == "72h"
     ready = wait_until(lambda: c.snapshot() if c.snapshot()["current_battle_id"] == "TEST-123" else None)
     assert ready["can_stop"] and ready["last_progress_at"]
     log = Path(ready["log_path"])

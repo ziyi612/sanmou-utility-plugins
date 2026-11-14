@@ -20,15 +20,21 @@ try:
         LUA_JSON, DEFAULT_OUT_DIR, atomic_json, atomic_bytes, capture_report, decode_envelope,
         lua_string, run_checked, validate_battle_id, identity_guard_lua, safe_output_path, prefetch_reports,
         RuntimeBridgeUnavailable,
+        artifact_exists, artifact_bytes,
     )
+    from .memory_storage import verified_store
     from .peerless_capture import page_evaluation_lua, evaluation_metadata, PeerlessPageResponse
+    from .collection_window import DEFAULT_TIME_RANGE, TIME_RANGE_HOURS, battle_timestamp, validate_time_range
 except ImportError:
     from export_battle_report_runtime import (
         LUA_JSON, DEFAULT_OUT_DIR, atomic_json, atomic_bytes, capture_report, decode_envelope,
         lua_string, run_checked, validate_battle_id, identity_guard_lua, safe_output_path, prefetch_reports,
         RuntimeBridgeUnavailable,
+        artifact_exists, artifact_bytes,
     )
+    from memory_storage import verified_store
     from peerless_capture import page_evaluation_lua, evaluation_metadata, PeerlessPageResponse
+    from collection_window import DEFAULT_TIME_RANGE, TIME_RANGE_HOURS, battle_timestamp, validate_time_range
 
 SCOPES = ("personal", "union", "star")
 ROUTES = {
@@ -234,7 +240,8 @@ class BattleCollector:
                  poll_seconds: float = 0.5, request_delay: float = 0.5,
                  max_pages: int = 10000, on_export: Callable[[Path], Any] | None = None,
                  namespace: str = "default", on_progress: Callable[[dict[str, Any]], Any] | None = None,
-                 parallelism: int = 1, owner_id: str | None = None, pvp_only: bool = False):
+                 parallelism: int = 1, owner_id: str | None = None, pvp_only: bool = False,
+                  time_range: str = "all", artifact_store=None):
         if any(scope not in SCOPES for scope in scopes) or not scopes:
             raise ValueError(f"Scopes must be chosen from {SCOPES}")
         if (not all(math.isfinite(v) for v in (wait_seconds, poll_seconds, request_delay))
@@ -247,10 +254,15 @@ class BattleCollector:
             raise ValueError("owner_id must be a nonempty string")
         if not isinstance(pvp_only, bool):
             raise ValueError("pvp_only must be a boolean")
+        self.artifact_store = verified_store(artifact_store)
+        if self.artifact_store is not None and parallelism != 1:
+            raise ValueError("Cloud-only capture requires parallelism=1 to bound pending in-memory originals")
+        self.time_range = validate_time_range(time_range)
         self.owner = owner_id if owner_id is not None else uuid.uuid4().hex
         self.raw_runner = runner
-        self.runner, self.out_dir = CollectorLeaseRunner(runner, self.owner), safe_output_path(out_dir)
-        self.state_file = safe_output_path(state_file) if state_file else self.out_dir / "collector_state.json"
+        self.runner = CollectorLeaseRunner(runner, self.owner)
+        self.out_dir = Path(out_dir) if self.artifact_store is not None else safe_output_path(out_dir)
+        self.state_file = (Path(state_file) if self.artifact_store is not None else safe_output_path(state_file)) if state_file else self.out_dir / "collector_state.json"
         self.scopes = tuple(dict.fromkeys(scopes))
         self.wait_seconds, self.poll_seconds = wait_seconds, poll_seconds
         self.request_delay, self.max_pages = request_delay, max_pages
@@ -259,13 +271,18 @@ class BattleCollector:
         self.parallelism = parallelism
         self.pvp_only = pvp_only
         self.lease_seconds = max(300, math.ceil(wait_seconds * 4 + 90), math.ceil(request_delay + 90))
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        if self.state_file.exists():
-            self.state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        if self.artifact_store is not None:
+            saved_state = self.artifact_store.load_state(namespace)
+        else:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            saved_state = json.loads(self.state_file.read_text(encoding="utf-8")) if self.state_file.exists() else None
+        if saved_state is not None:
+            self.state = saved_state
             if self.state.get("version") != 1 or self.state.get("namespace") != namespace:
                 raise ValueError("Collector state version/namespace mismatch; select a separate state file")
         else:
             self.state = {"version": 1, "namespace": namespace, "reports": {}, "scopes": {}, "cycles": 0}
+        self.runner.battle_request_allowed = self._time_request_allowed
         self._stop_event: Any = None
         # Set only while run_cycle owns the runtime hooks. Direct discovery and
         # collect_pending callers keep their previous independent behavior.
@@ -276,7 +293,29 @@ class BattleCollector:
 
     def save(self) -> None:
         self.state["updatedAt"] = time.time()
-        atomic_json(self.state_file, self.state, compact=True)
+        if self.artifact_store is not None:
+            self.artifact_store.save_state(self.namespace, self.state)
+        else:
+            atomic_json(self.state_file, self.state, compact=True)
+
+    def _exists(self, path):
+        return artifact_exists(path, self.artifact_store)
+
+    def _read_bytes(self, path):
+        return artifact_bytes(path, self.artifact_store)
+
+    def _write_bytes(self, path, raw):
+        options = {"artifact_store": self.artifact_store} if self.artifact_store is not None else {}
+        return atomic_bytes(path, raw, **options)
+
+    def _write_json(self, path, value):
+        options = {"artifact_store": self.artifact_store} if self.artifact_store is not None else {}
+        return atomic_json(path, value, **options)
+
+    def _capture_report(self, *arguments, **options):
+        if self.artifact_store is not None:
+            options["artifact_store"] = self.artifact_store
+        return capture_report(*arguments, **options)
 
     def stopped(self) -> bool:
         return bool(self._stop_event is not None and self._stop_event.is_set())
@@ -309,17 +348,47 @@ class BattleCollector:
             verdicts.add("pvp" if kind == pvp else "pve")
         return next(iter(verdicts)) if len(verdicts) == 1 else "unknown"
 
-    def _network_selected(self, entry: dict[str, Any]) -> bool:
-        return not self.pvp_only or self.battle_class(entry) == "pvp"
+    def time_class(self, entry: dict[str, Any], *, now: float | None = None) -> str:
+        hours = TIME_RANGE_HOURS[self.time_range]
+        if hours is None:
+            return "included"
+        stamp = battle_timestamp(entry)
+        if stamp is None:
+            return "unknown"
+        checked_at = time.time() if now is None else now
+        return "included" if checked_at - hours * 3600 <= stamp <= checked_at else "outside"
+
+    def _time_request_allowed(self, battle_id: int) -> bool:
+        # The exporter invokes this immediately before each component RPC,
+        # after any pacing or waiting for an earlier component has finished.
+        if self.time_range == "all":
+            return True
+        entry = self.state["reports"].get(str(battle_id))
+        return entry is not None and self.time_class(entry) == "included"
+
+    def _network_selected(self, entry: dict[str, Any], *, now: float | None = None) -> bool:
+        return ((not self.pvp_only or self.battle_class(entry) == "pvp")
+                and self.time_class(entry, now=now) == "included")
 
     def filter_summary(self, entries) -> dict[str, Any]:
+        entries = list(entries)
+        checked_at = time.time()
         classes = [self.battle_class(entry) for entry in entries]
+        times = [self.time_class(entry, now=checked_at) for entry in entries]
         pvp, pve, unknown = (classes.count(kind) for kind in ("pvp", "pve", "unknown"))
+        hours = TIME_RANGE_HOURS[self.time_range]
         return {"mode": "pvp_only" if self.pvp_only else "all", "pvpReports": pvp,
                 "pveReports": pve, "unknownReports": unknown,
-                "excludedReports": pve + unknown if self.pvp_only else 0,
+                "excludedReports": sum(not self._network_selected(entry, now=checked_at) for entry in entries),
                 "classification": "runtime_CommonConst.BATTLEOBJECTMATCHTYPE",
-                "unknownPolicy": "skip_network_requests" if self.pvp_only else "collect"}
+                "unknownPolicy": "skip_network_requests" if self.pvp_only else "collect",
+                "timeRange": self.time_range,
+                "timeCutoff": checked_at - hours * 3600 if hours is not None else None,
+                "timeCheckedAt": checked_at,
+                "timeExcludedReports": times.count("outside"),
+                "timeUnknownReports": times.count("unknown"),
+                "timeBasis": "endTimeStampTime_then_timeStamp",
+                "timeUnknownPolicy": "collect" if hours is None else "skip_network_requests"}
 
     def _notify_progress(self, value: dict[str, Any]) -> None:
         if self.on_progress is not None:
@@ -398,8 +467,8 @@ class BattleCollector:
             payload["runtimeIdentity"] = self.state["runtimeIdentity"]
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         path = self.out_dir / "captures" / str(battle_id) / (hashlib.sha256(raw).hexdigest() + ".json")
-        if not path.exists():
-            atomic_bytes(path, raw)
+        if not self._exists(path):
+            self._write_bytes(path, raw)
         entry["discoveryArchivePath"] = str(path)
         if self.on_export and entry.get("discoveryImportedPath") != str(path):
             entry["pendingDiscoveryImport"] = {"path": str(path)}
@@ -437,8 +506,8 @@ class BattleCollector:
         digest = hashlib.sha256(json.dumps(envelope, sort_keys=True, ensure_ascii=False,
                                            separators=(",", ":")).encode()).hexdigest()
         page_path = self.out_dir / "list_responses" / f"{digest}.json"
-        if not page_path.exists():
-            atomic_json(page_path, envelope)
+        if not self._exists(page_path):
+            self._write_json(page_path, envelope)
         if envelope.get("serializationIssues"):
             raise ValueError(f"List response contains serialization issues; retained at {page_path}")
         try:
@@ -795,20 +864,20 @@ class BattleCollector:
         response with those changing links creates another original per list
         refresh, and leaves the actual received bytes for startup recovery.
         """
-        raw = path.read_bytes()
+        raw = self._read_bytes(path)
         self._validate_capture_payload(entry, json.loads(raw))
         battle_id = str(validate_battle_id(entry["battleID"]))
         original = self.out_dir / "captures" / battle_id / f"{hashlib.sha256(raw).hexdigest()}.json"
         if original.resolve() != path.resolve():
-            if original.exists():
-                if original.read_bytes() != raw:
+            if self._exists(original):
+                if self._read_bytes(original) != raw:
                     raise ValueError("Checkpoint SHA path contains different bytes")
             else:
-                atomic_bytes(original, raw)
+                self._write_bytes(original, raw)
         return original
 
     def _capture_revision(self, entry: dict[str, Any], path: Path, *, update_alias=False) -> Path:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(self._read_bytes(path).decode("utf-8"))
         self._validate_capture_payload(entry, payload)
         payload["discovery"] = list(entry.get("observations", {}).values())
         payload["namespace"] = self.namespace
@@ -816,10 +885,10 @@ class BattleCollector:
         # without rewriting the exact bytes preserved before the client's retry.
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         revision = self.out_dir / "captures" / str(entry["battleID"]) / f"{hashlib.sha256(raw).hexdigest()}.json"
-        if not revision.exists():
-            atomic_bytes(revision, raw)
+        if not self._exists(revision):
+            self._write_bytes(revision, raw)
         if update_alias:
-            atomic_bytes(path, raw)
+            self._write_bytes(path, raw)
         return revision
 
     def _import_capture_path(self, path: Path) -> None:
@@ -953,14 +1022,14 @@ class BattleCollector:
             failed_before = counts["failed"]
             try:
                 try:
-                    result = capture_report(self.runner, int(battle_id), self.out_dir, self.wait_seconds,
+                    result = self._capture_report(self.runner, int(battle_id), self.out_dir, self.wait_seconds,
                         self.poll_seconds, expected_identity=self.state.get("runtimeIdentity"),
                         prefetched_requests=pending.get("metadata"), request_missing=False)
                 except ValueError as exc:
                     # Bad request metadata must never attach another battle's
                     # acknowledgement. Retain this ID's own cache with an
                     # explicit failure, still without issuing fresh requests.
-                    result = capture_report(self.runner, int(battle_id), self.out_dir, self.wait_seconds,
+                    result = self._capture_report(self.runner, int(battle_id), self.out_dir, self.wait_seconds,
                         self.poll_seconds, expected_identity=self.state.get("runtimeIdentity"),
                         prefetched_requests=self._prefetch_failure_metadata(battle_id, str(exc)),
                         request_missing=False)
@@ -991,7 +1060,7 @@ class BattleCollector:
         # capture files are writable. Keep a separate durable error record.
         path = self.out_dir / "recovery_errors" / f"{time.time_ns()}_{uuid.uuid4().hex}.json"
         try:
-            atomic_json(path, {"at": time.time(), "namespace": self.namespace, "errors": errors})
+            self._write_json(path, {"at": time.time(), "namespace": self.namespace, "errors": errors})
             self.state["prefetchRecoveryErrorLog"] = str(path)
         except Exception as exc:
             errors.append({"phase": "prefetch_recovery_error_log", "error": str(exc)})
@@ -1136,6 +1205,8 @@ class BattleCollector:
                     old_network_attempt = not metadata_only and entry.get("attempts", 0) > 0
                     if old_network_attempt:
                         old_retry_started_at = time.monotonic()
+                    previous_attempts = entry.get("attempts", 0)
+                    previous_attempt_at = entry.get("lastAttemptAt")
                     entry["attempts"] = entry.get("attempts", 0) + 1
                     entry["lastAttemptAt"] = time.time()
                     attempted.add(battle_id)
@@ -1150,9 +1221,24 @@ class BattleCollector:
                         # no new component responses to publish or reindex.
                         result["cacheCheckpointPaths"] = []
                         original_path = Path(result.get("archivePath", result["path"]))
-                        payload = json.loads(original_path.read_text(encoding="utf-8"))
-                        atomic_json(Path(result["path"]), payload)
+                        payload = json.loads(self._read_bytes(original_path).decode("utf-8"))
+                        self._write_json(Path(result["path"]), payload)
                     else:
+                        # A large checkpoint write may outlast the remaining
+                        # window. Check again before dispatch; already-prefetched
+                        # bytes still get harvested without fresh requests.
+                        if battle_id not in inflight and not self._network_selected(entry):
+                            entry["attempts"] = previous_attempts
+                            if previous_attempt_at is None:
+                                entry.pop("lastAttemptAt", None)
+                            else:
+                                entry["lastAttemptAt"] = previous_attempt_at
+                            attempted.discard(battle_id)
+                            if self._cycle_attempted is not None:
+                                self._cycle_attempted.discard(battle_id)
+                            counts["skipped"] += 1
+                            self.save()
+                            continue
                         active_capture = {"battleID": entry["battleID"], "startedAt": time.monotonic(),
                                           "outcome": "failed", "started_at": datetime.now(timezone.utc).isoformat()}
                         self._notify_progress({"phase": "capture_started", "battleID": entry["battleID"]})
@@ -1185,13 +1271,14 @@ class BattleCollector:
                                             inflight[bid] = {"metadata": self._prefetch_failure_metadata(
                                                 bid, "Prefetch did not acknowledge this battle"), "request_missing": False}
                             pending_prefetch = inflight.get(battle_id, {})
-                            result = capture_report(self.runner, int(entry["battleID"]), self.out_dir, self.wait_seconds,
+                            result = self._capture_report(self.runner, int(entry["battleID"]), self.out_dir, self.wait_seconds,
                                 self.poll_seconds, expected_identity=self.state.get("runtimeIdentity"),
                                 prefetched_requests=pending_prefetch.get("metadata"),
-                                request_missing=pending_prefetch.get("request_missing", False))
+                                request_missing=(pending_prefetch.get("request_missing", False)
+                                                 and self._network_selected(entry)))
                             inflight.pop(battle_id, None)  # A returned export has already reached disk.
                         else:
-                            result = capture_report(self.runner, int(entry["battleID"]), self.out_dir, self.wait_seconds,
+                            result = self._capture_report(self.runner, int(entry["battleID"]), self.out_dir, self.wait_seconds,
                                                     self.poll_seconds, expected_identity=self.state.get("runtimeIdentity"))
                     self._store_captured_result(entry, result, counts)
                     if active_capture is not None:
@@ -1322,8 +1409,8 @@ class BattleCollector:
             current = [e for e in self.state["reports"].values() if e.get("lastSeenCycle") == self.state["cycles"]]
             summary["filter"] = self.filter_summary(current)
             summary["allVisibleReports"] = len(current)
-            if self.pvp_only:
-                current = [entry for entry in current if self._network_selected(entry)]
+            current = [entry for entry in current if self._network_selected(
+                entry, now=summary["filter"]["timeCheckedAt"])]
             summary["visibleReports"] = len(current)
             summary["completeVisibleReports"] = sum(bool(e.get("complete")) for e in current)
             summary["enumerationComplete"] = (
@@ -1332,18 +1419,26 @@ class BattleCollector:
                 and not summary.get("error") and not summary.get("cleanupError")
             )
             summary["coverageComplete"] = (summary["enumerationComplete"]
-                and (summary["visibleReports"] > 0 or (self.pvp_only and summary["allVisibleReports"] > 0
-                                                     and not summary["filter"]["unknownReports"]))
+                and (summary["visibleReports"] > 0 or ((self.pvp_only or self.time_range != "all")
+                    and summary["allVisibleReports"] > 0
+                    and not (self.pvp_only and summary["filter"]["unknownReports"])
+                    and not summary["filter"]["timeUnknownReports"]))
                 and summary["completeVisibleReports"] == summary["visibleReports"]
                 and not any(e.get("discoveryImportError") or e.get("pendingDiscoveryImport") for e in current)
                 and not self.state.get("prefetchRecoveryErrors"))
             if self.pvp_only and summary["filter"]["unknownReports"]:
                 summary["coverageComplete"] = False
+            if summary["filter"]["timeUnknownReports"]:
+                summary["coverageComplete"] = False
             summary["warnings"] = [] if current else ["no_reports_observed_end_to_end_collection_unverified"]
             if not current and self.pvp_only and summary["allVisibleReports"]:
                 summary["warnings"] = ["no_confirmed_pvp_reports_in_visible_lists"]
+            if not current and self.time_range != "all" and summary["allVisibleReports"]:
+                summary["warnings"] = ["no_reports_in_selected_time_range"]
             if self.pvp_only and summary["filter"]["unknownReports"]:
                 summary["warnings"].append("unclassified_reports_skipped_without_component_requests")
+            if summary["filter"]["timeUnknownReports"]:
+                summary["warnings"].append("unknown_battle_times_skipped_without_component_requests")
             summary["complete"] = summary["coverageComplete"]
             summary["errors"] = [
                 {"scope": scope, "error": value.get("error", "scope enumeration incomplete")}
@@ -1368,7 +1463,7 @@ class BattleCollector:
                 if primary_error is None:
                     raise
             try:
-                atomic_json(self.out_dir / "collector_manifest.json", summary)
+                self._write_json(self.out_dir / "collector_manifest.json", summary)
             except Exception:
                 if primary_error is None:
                     raise
@@ -1407,6 +1502,8 @@ def main() -> None:
     parser.add_argument("--request-delay", type=float, default=0.5)
     parser.add_argument("--max-pages", type=int, default=10000)
     parser.add_argument("--pvp-only", action="store_true", help="仅请求当前客户端明确标为PVP的战报正文，PVE及未知类型跳过")
+    parser.add_argument("--time-range", choices=tuple(TIME_RANGE_HOURS), default=DEFAULT_TIME_RANGE,
+                        help="按战斗结束时间选择下载时段，缺少结束时间时用开始时间；默认最近24小时")
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--max-cycles", type=int)
@@ -1428,7 +1525,7 @@ def main() -> None:
     with GameLuaRunner(args.pid) as runner:
         collector = BattleCollector(runner, args.out_dir, args.state_file,
             scopes, args.wait, args.poll, args.request_delay,
-            args.max_pages, namespace=args.namespace, pvp_only=args.pvp_only)
+            args.max_pages, namespace=args.namespace, pvp_only=args.pvp_only, time_range=args.time_range)
         if args.watch:
             collector.watch(args.interval, args.max_cycles)
         else:

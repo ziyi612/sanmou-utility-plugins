@@ -190,3 +190,77 @@ def test_missing_project_is_a_visible_nonzero_error(launch_area):
     result = install(missing, desktop)
     assert result.returncode != 0
     assert not list(desktop.iterdir())
+
+
+@pytest.mark.parametrize("marker", ["launcher", "quark"])
+def test_memory_launcher_discards_streams_without_creating_report_log_files(launch_area, monkeypatch, marker):
+    monkeypatch.delenv("SANMOU_QUARK_CONFIG", raising=False)
+    project = launcher_project(launch_area)
+    if marker == "launcher":
+        path = project / "config/launcher.json"
+        config = json.loads(path.read_text("utf-8"))
+        config["storage_backend"] = "quark-memory"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        (project / "config/quark.local.json").write_text("{}", encoding="utf-8")
+    else:
+        (project / "config/quark.local.json").write_text(
+            json.dumps({"storage_backend": "quark-memory"}), encoding="utf-8")
+    script = project / "battle_reports_gui.py"
+    script.write_text(script.read_text("utf-8") +
+        "print('synthetic report stdout', flush=True)\nprint('synthetic report stderr', file=sys.stderr, flush=True)\n",
+        encoding="utf-8")
+    result = project_ps(project)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (project / "battle_reports_gui.invocation.json").exists()
+    assert not (project / "logs").exists()
+    assert "synthetic report stdout" not in result.stdout
+    assert "synthetic report stderr" not in result.stderr
+    assert '"report_logs_on_disk": false' in result.stdout
+
+
+@pytest.mark.parametrize("filename", ["launcher.json", "quark.local.json"])
+@pytest.mark.parametrize("invalid", [None, [], "invalid-object", 7])
+def test_launcher_invalid_mode_shape_fails_before_creating_logs(launch_area, monkeypatch, filename, invalid):
+    monkeypatch.delenv("SANMOU_QUARK_CONFIG", raising=False)
+    project = launcher_project(launch_area)
+    (project / "config" / filename).write_text(json.dumps(invalid), encoding="utf-8")
+    result = project_ps(project)
+    assert result.returncode != 0
+    assert "must be a JSON object" in result.stderr
+    assert not (project / "logs").exists()
+    assert not (project / "battle_reports_gui.invocation.json").exists()
+
+
+def test_desktop_launcher_forwards_time_range_without_starting_collection(launch_area):
+    project = launcher_project(launch_area)
+    result = project_ps(project, "-TimeRange", "7d")
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    captured = json.loads((project / "battle_reports_gui.invocation.json").read_text("utf-8"))
+    assert captured["args"] == ["--interval", "60", "--time-range", "7d"]
+    assert not (project / "battle_reports.invocation.json").exists()
+
+
+@pytest.mark.parametrize("case", ["default_strict_env_legacy", "no_launcher_both_legacy", "invalid_default_env_legacy"])
+def test_launcher_override_cannot_hide_default_strict_mode_or_invalid_configuration(launch_area, monkeypatch, case):
+    project = launcher_project(launch_area)
+    default = project / "config/quark.local.json"
+    selected = project / "config/alternate-quark.json"
+    selected.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+    monkeypatch.setenv("SANMOU_QUARK_CONFIG", str(selected))
+    if case == "default_strict_env_legacy":
+        default.write_text(json.dumps({"storage_backend": "quark-memory"}), encoding="utf-8")
+    elif case == "no_launcher_both_legacy":
+        default.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+        (project / "config/launcher.json").unlink()
+    else:
+        default.write_text("[]", encoding="utf-8")
+    result = project_ps(project)
+    assert not (project / "logs").exists()
+    assert not (project / "battle_reports.invocation.json").exists()
+    if case == "default_strict_env_legacy":
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert '"report_logs_on_disk": false' in result.stdout
+        assert (project / "battle_reports_gui.invocation.json").exists()
+    else:
+        assert result.returncode != 0
+        assert not (project / "battle_reports_gui.invocation.json").exists()
