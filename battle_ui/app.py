@@ -155,7 +155,7 @@ class _MemoryCloudPanel(tk.Frame):
     def render(self, result):
         from parser.quark_cloud import public_result
         self.note.set("云端暂不可读取：" + str(result["error"]) if result.get("error") else
-                      "已读取云端状态。本机不保存战报数据库、原文文件或磁盘缓存。")
+                      "已读取云端状态。严格模式只在运行内存中处理战报；已有历史以迁移清理结果为准。")
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         if result.get("error"):
