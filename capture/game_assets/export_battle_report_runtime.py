@@ -16,11 +16,13 @@ try:
     from .runtime_errors import RuntimeBridgeUnavailable, is_bridge_exception
     from . import runtime_response_audit as response_audit
     from .memory_storage import verified_store
+    from .capture_mode import require_local_capture
 except ImportError:
     from atomic_files import replace_with_retry
     from runtime_errors import RuntimeBridgeUnavailable, is_bridge_exception
     import runtime_response_audit as response_audit
     from memory_storage import verified_store
+    from capture_mode import require_local_capture
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT_DIR = ROOT / "capture" / "output" / "processed" / "battle_reports"
@@ -991,6 +993,10 @@ def main() -> None:
     parser.add_argument("--basic-on-timeout", action="store_true", help="Compatibility flag: partial data is always retained and labelled.")
     parser.add_argument("--direct", action="store_true")
     args = parser.parse_args()
+    try:
+        require_local_capture()
+    except ValueError as error:
+        parser.error(str(error))
     args.out_dir = safe_output_path(args.out_dir)
     if not math.isfinite(args.wait) or not math.isfinite(args.poll) or args.wait < 0 or args.poll <= 0:
         parser.error("--wait must be nonnegative and --poll must be positive")

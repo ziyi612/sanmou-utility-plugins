@@ -23,6 +23,7 @@ try:
         artifact_exists, artifact_bytes,
     )
     from .memory_storage import verified_store
+    from .capture_mode import require_local_capture
     from .peerless_capture import page_evaluation_lua, evaluation_metadata, PeerlessPageResponse
     from .collection_window import DEFAULT_TIME_RANGE, TIME_RANGE_HOURS, battle_timestamp, validate_time_range
 except ImportError:
@@ -33,6 +34,7 @@ except ImportError:
         artifact_exists, artifact_bytes,
     )
     from memory_storage import verified_store
+    from capture_mode import require_local_capture
     from peerless_capture import page_evaluation_lua, evaluation_metadata, PeerlessPageResponse
     from collection_window import DEFAULT_TIME_RANGE, TIME_RANGE_HOURS, battle_timestamp, validate_time_range
 
@@ -1508,6 +1510,10 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--max-cycles", type=int)
     args = parser.parse_args()
+    try:
+        require_local_capture()
+    except ValueError as error:
+        parser.error(str(error))
     if (not all(math.isfinite(value) for value in (args.wait, args.poll, args.request_delay, args.interval))
             or args.wait < 0 or args.poll <= 0 or args.request_delay < 0 or args.interval <= 0
             or args.max_pages <= 0 or (args.max_cycles is not None and args.max_cycles <= 0)):

@@ -19,6 +19,8 @@ python -B battle_reports_gui.py
 
 安装器会校验固定版本的官方运行时，在项目 `.runtime/quark-memory/` 安装 `memfs@4.80.1` 和 `fs-monkey@1.1.0`，并在本地配置及启动配置中持久记录 `quark-memory` 模式。再次打开或从命令行采集都会沿用该模式；配置缺失或损坏时阻止启动，不能悄悄回退到本地存储。程序、依赖和不含战报的设置仍保存在项目目录；官方工具仅可在原有账号目录读取或刷新既有凭据，凭据不进入 GitHub。这个适配沿用真实授权的 Codex 上下文，不表示夸克提供通用 standalone SDK。
 
+严格模式下，直接运行本仓库已分发的旧入口 `capture/game_assets/battle_collector.py` 或 `capture/game_assets/export_battle_report_runtime.py`，会在创建输出目录或初始化游戏连接前停止，并提示使用 `start_battle_archive.cmd` 或 `python -B battle_reports.py collect`。已有模式配置损坏或含未知值时也会先拒绝执行；未配置及旧本地兼容模式保留原有行为。切换存储模式前请先停止已有采集器，再从统一入口启动。
+
 严格模式有以下使用边界：
 
 - 查阅档案需要联网。云端读取失败会显示错误，不使用旧目录或本地缓存冒充当前结果。

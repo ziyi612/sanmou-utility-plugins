@@ -648,6 +648,7 @@ class CollectorStateTests(unittest.TestCase):
 
     def test_partial_export_cli_saves_manifest_and_exits_two(self):
         import capture.game_assets.export_battle_report_runtime as exporter
+        from capture.game_assets import capture_mode
         class Runner:
             def __init__(self,pid): pass
             def __enter__(self): return self
@@ -655,8 +656,15 @@ class CollectorStateTests(unittest.TestCase):
         module=ModuleType("capture.game_assets.run_lua_in_game")
         module.GameLuaRunner=Runner
         with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.mkdir()
+            (config / "launcher.json").write_text('{"storage_backend":"local"}', encoding="utf-8")
+            provider = config / "quark.local.json"
+            provider.write_text('{}', encoding="utf-8")
             record={"battleID":123,"exported":True,"complete":False}
             with patch.dict(sys.modules,{"capture.game_assets.run_lua_in_game":module}), \
+                 patch.object(capture_mode,"ROOT",Path(directory)), \
+                 patch.dict(os.environ,{"SANMOU_QUARK_CONFIG":str(provider)}), \
                  patch.object(sys,"argv",["export","123","--out-dir",directory]), \
                  patch.object(exporter,"capture_report",return_value=record), redirect_stdout(io.StringIO()):
                 with self.assertRaises(SystemExit) as caught:

@@ -263,7 +263,8 @@ def scenario_actual_memory_gui(tmp_path):
         app.export_selected()
         app.open_logs()
         app.show_page("cloud")
-        pump(lambda: "本机不保存" in app.cloud_panel.note.get())
+        pump(lambda: app.cloud_panel.note.get().startswith("已读取云端状态。")
+             and "运行内存" in app.cloud_panel.note.get())
         app.close()
         assert controller.closed
         del app
