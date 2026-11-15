@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import io
 import json
 import os
@@ -265,7 +266,7 @@ def test_compressed_ram_lru_enforces_byte_budget_and_reloads_evicted_chunk(tmp_p
     for name in ["a", "b", "a", "c"]:
         fresh.read_file(name)
         assert fresh._compressed_cache_size == sum(map(len, fresh._compressed_cache.values())) <= budget
-    assert refs["b"]["stored_sha256"] not in fresh._compressed_cache
+    assert fresh._chunk_cache_key(refs["b"]) not in fresh._compressed_cache
     fresh.read_file("b")
     assert downloads_of(client, refs["b"]["fid"]) - before_b == 2
 
@@ -276,7 +277,7 @@ def test_corrupt_compressed_ram_entry_is_rejected_before_returning_file(tmp_path
     fresh.refresh()
     fresh.read_file("a")
     fresh.read_file("b")
-    identity = refs["a"]["stored_sha256"]
+    identity = fresh._chunk_cache_key(refs["a"])
     valid = fresh._compressed_cache[identity]
     fresh._compressed_cache[identity] = bytes([valid[0] ^ 1]) + valid[1:]
     before = downloads_of(client, refs["a"]["fid"])
@@ -300,3 +301,97 @@ def test_raw_validation_failure_is_not_admitted_and_cached_reads_still_check_who
     part["offset"], part["length"] = 1, 99
     with pytest.raises(CloudError, match="整份"):
         other.read_file("a")
+
+
+def test_valid_stored_chunk_larger_than_default_write_limit_reads_with_actual_size(tmp_path):
+    raw = b"large-cold-archive-fixture" * ((8 * 1024 * 1024) // 25 + 100)
+    stored = gzip.compress(raw, compresslevel=0, mtime=0)
+    assert 8 * 1024 * 1024 < len(stored) < 64 * 1024 * 1024
+    client = MemoryClient()
+    client.objects["large"] = ("large-read-fixture.gz", stored)
+    store = CloudStore(config_file(tmp_path), client, compressed_cache_bytes=16 * 1024 * 1024)
+    requested = []
+    original_download = client.download_bytes
+    def download(fid, *, max_bytes):
+        requested.append((fid, max_bytes))
+        return original_download(fid, max_bytes=max_bytes)
+    client.download_bytes = download
+    ref = {"fid": "large", "stored_sha256": sha(stored), "stored_size": len(stored),
+           "raw_sha256": sha(raw), "raw_size": len(raw)}
+    assert store._read_chunk(ref) == raw
+    assert requested == [("large", len(stored))]
+    assert store._compressed_cache_size == len(stored)
+
+
+@pytest.mark.parametrize("layer", ["decoded", "compressed"])
+@pytest.mark.parametrize("bad", [True, False, 0, -1, 64 * 1024 * 1024 + 1, "24", 24.0, None])
+def test_invalid_stored_size_is_rejected_before_either_cache_can_answer(tmp_path, layer, bad):
+    client, config, _store, refs = two_chunks(tmp_path)
+    fresh = CloudStore(config, client, compressed_cache_bytes=1024)
+    fresh.refresh()
+    raw = fresh.read_file("a")
+    ref = {**refs["a"], "stored_size": bad}
+    key = fresh._chunk_cache_key(ref)
+    if layer == "decoded":
+        fresh._cached_chunk = (key, raw)
+    else:
+        fresh._cached_chunk = None
+        fresh._compressed_cache[key] = client.objects[refs["a"]["fid"]][1]
+    before = len(client.downloads)
+    with pytest.raises(CloudError, match="压缩长度"):
+        fresh._read_chunk(ref)
+    assert len(client.downloads) == before
+
+
+@pytest.mark.parametrize("layer", ["decoded", "compressed"])
+@pytest.mark.parametrize("field", ["stored_size", "raw_size", "raw_sha256", "stored_sha256", "fid"])
+def test_valid_range_but_wrong_identity_cannot_reuse_old_cache_entry(tmp_path, layer, field):
+    client, config, _store, refs = two_chunks(tmp_path)
+    fresh = CloudStore(config, client, compressed_cache_bytes=1024)
+    fresh.refresh()
+    fresh.read_file("a")
+    if layer == "compressed":
+        fresh.read_file("b")
+    ref = dict(refs["a"])
+    if field in ("stored_size", "raw_size"):
+        ref[field] += 1
+    elif field in ("stored_sha256", "raw_sha256"):
+        ref[field] = "0" * 64
+    else:
+        ref["fid"] = "wrong-position"
+        client.objects[ref["fid"]] = ("wrong-position.gz", gzip.compress(b"other", mtime=0))
+    expected_request_size = ref["stored_size"]
+    requested = []
+    original_download = client.download_bytes
+    def download(fid, *, max_bytes):
+        requested.append((fid, max_bytes))
+        return original_download(fid, max_bytes=max_bytes)
+    client.download_bytes = download
+    with pytest.raises(CloudError):
+        fresh._read_chunk(ref)
+    assert requested == [(ref["fid"], expected_request_size)]
+
+
+def test_inclusive_64m_read_bound_reaches_transport_but_still_rejects_wrong_actual_length(tmp_path):
+    client, config, _store, refs = two_chunks(tmp_path)
+    fresh = CloudStore(config, client)
+    requested = []
+    original_download = client.download_bytes
+    def download(fid, *, max_bytes):
+        requested.append(max_bytes)
+        return original_download(fid, max_bytes=max_bytes)
+    client.download_bytes = download
+    with pytest.raises(CloudError, match="SHA-256 或长度"):
+        fresh._read_chunk({**refs["a"], "stored_size": 64 * 1024 * 1024})
+    assert requested == [64 * 1024 * 1024]
+
+
+def test_default_write_cap_stays_8m_while_read_cap_is_64m(tmp_path):
+    assert module.MAX_STORED_CHUNK == 8 * 1024 * 1024
+    assert module.MAX_STORED_READ == 64 * 1024 * 1024
+    assert module.MAX_RAW_CHUNK == 256 * 1024 * 1024
+    client = MemoryClient()
+    store = CloudStore(config_file(tmp_path), client)
+    with pytest.raises(CloudError, match="单次内存"):
+        store._upload_verified(b"x" * (8 * 1024 * 1024 + 1), "oversize-default-write.gz")
+    assert client.uploads == []

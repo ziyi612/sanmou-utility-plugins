@@ -107,14 +107,17 @@ class MemoryQuarkClient:
     existing account configuration may be refreshed on its original drive.
     """
 
-    def __init__(self, config_path=None, config=None):
+    def __init__(self, config_path=None, config=None, *, max_upload_bytes=MAX_OBJECT_BYTES):
+        if isinstance(max_upload_bytes, bool) or not isinstance(max_upload_bytes, int) or not 1 <= max_upload_bytes <= 64 * 1024 * 1024:
+            raise ValueError("max_upload_bytes must be an integer between 1 and 64 MiB")
+        self.max_upload_bytes = max_upload_bytes
         self.config = dict(config) if config is not None else load_config(config_path)
         self.folder_id = self.config.get("folder_id")
         self.last_audit = None
 
     def _call(self, action, *, timeout=240, **payload):
-        # Retry the exact same immutable request. Only the typed error below
-        # enters this loop; policy/configuration/size/audit failures stay final.
+        # Retry the same immutable request for audited transient errors or
+        # read deadlines; policy/configuration/size/audit failures stay final.
         stable = copy.deepcopy(payload)
         for attempt in range(3):
             try:
@@ -124,6 +127,14 @@ class MemoryQuarkClient:
             except _TransientTransportError:
                 self.last_audit["transport_attempts"] = attempt + 1
                 if attempt == 2:
+                    raise
+                time.sleep(attempt + 1)
+            except subprocess.TimeoutExpired:
+                # A deadline has no final audit envelope. Discard any older
+                # audit and retry only reads; the next result must pass all
+                # normal audit checks. Writes retain their uncertain outcome.
+                self.last_audit = None
+                if action not in {"download", "list"} or attempt == 2:
                     raise
                 time.sleep(attempt + 1)
 
@@ -190,11 +201,13 @@ class MemoryQuarkClient:
     def upload_bytes(self, data: bytes, name: str, parent_fid: str | None = None) -> dict:
         if not isinstance(data, bytes):
             raise TypeError("data must be bytes")
-        if len(data) > MAX_OBJECT_BYTES:
-            raise CloudError("单个内存云对象不得超过16 MiB，请先分块。")
+        if len(data) > self.max_upload_bytes:
+            if self.max_upload_bytes == MAX_OBJECT_BYTES:
+                raise CloudError("单个内存云对象不得超过16 MiB，请先分块。")
+            raise CloudError(f"单个内存云对象超过设定上传限制（{self.max_upload_bytes}字节），请先分块。")
         if not isinstance(name, str) or not name or any(ch in name for ch in ('/', '\\', ':', '\0')) or name in {'.', '..'}:
             raise ValueError("Invalid cloud object name")
-        response = self._call("upload", timeout=900, parent_fid=self._parent(parent_fid), name=name,
+        response = self._call("upload", timeout=900, max_bytes=self.max_upload_bytes, parent_fid=self._parent(parent_fid), name=name,
                               body_base64=base64.b64encode(data).decode("ascii"))
         result = response["result"].get("data", {})
         fids = result.get("fids") or ([result["fileId"]] if result.get("fileId") else [])

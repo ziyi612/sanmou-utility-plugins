@@ -23,6 +23,7 @@ CATALOG_NAME = re.compile(r"^memory-catalog-v1-(\d{20})-([0-9a-f]{64})\.json\.gz
 MAX_RAW_CHUNK = 256 * 1024 * 1024
 MAX_STORED_CHUNK = 8 * 1024 * 1024
 MAX_CATALOG = 16 * 1024 * 1024
+MAX_STORED_READ = 64 * 1024 * 1024
 
 
 def sha(raw):
@@ -341,12 +342,25 @@ class CloudStore:
                 raise
 
     def _read_chunk(self, ref):
+        stored_size = ref.get("stored_size")
+        if type(stored_size) is not int or not 0 < stored_size <= MAX_STORED_READ:
+            raise CloudError("云端分片压缩长度必须是1至64 MiB内的整数。")
+        raw_size = ref.get("raw_size")
+        if type(raw_size) is not int or not 0 <= raw_size <= MAX_RAW_CHUNK:
+            raise CloudError("云端原文分片长度超出内存限制。")
         identity = ref["stored_sha256"]
-        if self._cached_chunk and self._cached_chunk[0] == identity:
+        if (not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity)
+                or not isinstance(ref.get("raw_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", ref["raw_sha256"])):
+            raise CloudError("云端分片 SHA-256 格式无效。")
+        if isinstance(ref.get("fid"), bool) or not isinstance(ref.get("fid"), (str, int)) or not str(ref["fid"]):
+            raise CloudError("云端分片位置无效。")
+        cache_key = self._chunk_cache_key(ref)
+        if self._cached_chunk and self._cached_chunk[0] == cache_key:
             return self._cached_chunk[1]
-        stored = self._compressed_cache.get(identity)
+        stored = self._compressed_cache.get(cache_key)
         if stored is None:
-            stored = self.client.download_bytes(ref["fid"], max_bytes=MAX_STORED_CHUNK)
+            stored = self.client.download_bytes(ref["fid"], max_bytes=stored_size)
         if len(stored) != ref["stored_size"] or sha(stored) != identity:
             raise CloudError("云端分片 SHA-256 或长度不匹配。")
         raw = unpack(stored, MAX_RAW_CHUNK)
@@ -356,15 +370,19 @@ class CloudStore:
         # follows a fresh network read and both compressed/raw validations;
         # every later use still validates and decodes the compressed bytes.
         if self.compressed_cache_bytes and len(stored) <= self.compressed_cache_bytes:
-            if identity not in self._compressed_cache:
+            if cache_key not in self._compressed_cache:
                 while self._compressed_cache_size + len(stored) > self.compressed_cache_bytes:
                     _, removed = self._compressed_cache.popitem(last=False)
                     self._compressed_cache_size -= len(removed)
-                self._compressed_cache[identity] = stored
+                self._compressed_cache[cache_key] = stored
                 self._compressed_cache_size += len(stored)
-            self._compressed_cache.move_to_end(identity)
-        self._cached_chunk = (identity, raw)
+            self._compressed_cache.move_to_end(cache_key)
+        self._cached_chunk = (cache_key, raw)
         return raw
+
+    @staticmethod
+    def _chunk_cache_key(ref):
+        return (str(ref["fid"]), ref["stored_sha256"], ref["stored_size"], ref["raw_sha256"], ref["raw_size"])
 
     def iter_file(self, key):
         self._ensure_loaded()

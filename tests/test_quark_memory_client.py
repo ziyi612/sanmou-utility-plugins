@@ -32,7 +32,11 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const parameters = process.argv.slice(2);
-function result(data) { console.log(JSON.stringify({type:'result',code:0,data})); process.exit(0); }
+function result(data) {
+  data.ramFixturePeakKiB=process.resourceUsage().maxRSS;
+  data.ramFixtureRssBytes=process.memoryUsage().rss;
+  console.log(JSON.stringify({type:'result',code:0,data})); process.exit(0);
+}
 function option(name) { return parameters[parameters.indexOf(name)+1]; }
 async function main() {
   const marker = path.join(process.cwd(), '.ram-quark', 'outside-download-report.json');
@@ -47,7 +51,9 @@ async function main() {
     fs.mkdirSync(directory,{recursive:true});
     const output = path.join(directory,'fixture.bin');
     const fd = fs.openSync(output,'w');
-    const bytes = Buffer.from('zero disk original\0中文','utf8');
+    const bytes = option('--fid') === 'fixture-large-63m'
+      ? Buffer.alloc(63*1024*1024,Buffer.from(Array.from({length:256},(_,index)=>index)))
+      : Buffer.from('zero disk original\0中文','utf8');
     fs.writeSync(fd,bytes,0,bytes.length,0);
     fs.closeSync(fd);
     result({filePath:output});
@@ -186,6 +192,64 @@ def test_oversized_upload_is_rejected_without_running_sdk(memory_client, monkeyp
         memory_client.upload_bytes(b"x" * (MAX_OBJECT_BYTES + 1), "fixture.gz")
 
 
+@pytest.mark.parametrize("limit", [True, False, None, 0, -1, 64 * 1024 * 1024 + 1, 1.5, "67108864"])
+def test_upload_limit_configuration_rejects_noninteger_or_out_of_range_values(limit):
+    with pytest.raises(ValueError, match="max_upload_bytes"):
+        MemoryQuarkClient(config={}, max_upload_bytes=limit)
+
+
+def test_default_upload_boundary_and_explicit_runner_limit_remain_sixteen_mib(memory_client, monkeypatch):
+    calls = []
+    def call(action, **kwargs):
+        calls.append((action, kwargs))
+        return {"result": {"data": {"fids": ["fixture"]}}}
+    monkeypatch.setattr(memory_client, "_call", call)
+    assert memory_client.max_upload_bytes == MAX_OBJECT_BYTES
+    raw = b"x" * MAX_OBJECT_BYTES
+    assert memory_client.upload_bytes(raw, "boundary.gz") == {"fid": "fixture", "size": len(raw)}
+    assert calls[0][0] == "upload" and calls[0][1]["max_bytes"] == MAX_OBJECT_BYTES
+    assert len(base64.b64decode(calls[0][1]["body_base64"])) == MAX_OBJECT_BYTES
+
+
+@pytest.mark.parametrize("limit", [1, 8])
+def test_explicit_small_upload_limit_rejects_before_starting_sdk(memory_client, monkeypatch, limit):
+    client = MemoryQuarkClient(config=memory_client.config, max_upload_bytes=limit)
+    monkeypatch.setattr(client, "_call", lambda *_a, **_k: pytest.fail("Oversized upload started SDK"))
+    with pytest.raises(CloudError, match=f"{limit}字节"):
+        client.upload_bytes(b"x" * (limit + 1), "fixture.gz")
+
+
+def test_opt_in_large_upload_and_download_cross_real_production_runner_only_in_ram(memory_client, monkeypatch):
+    """Sequential 63 MiB pipes/memfs regression, with bounded synthetic data."""
+    import gc
+    client = MemoryQuarkClient(config=memory_client.config, max_upload_bytes=64 * 1024 * 1024)
+    snapshots, limits = [], []
+    original = client._call
+    def call(action, **kwargs):
+        limits.append((action, kwargs["max_bytes"]))
+        response = original(action, **kwargs)
+        values = response["result"]["data"]
+        snapshots.append({"action": action, "peak_kib": values["ramFixturePeakKiB"], "rss_bytes": values["ramFixtureRssBytes"]})
+        assert response["audit"]["report_disk_writes"] == 0
+        assert response["audit"]["physical_writes"] == []
+        return response
+    monkeypatch.setattr(client, "_call", call)
+    size = 63 * 1024 * 1024
+    pattern = bytes(range(256))
+    raw = pattern * (size // len(pattern))
+    identity = hashlib.sha256(raw).hexdigest()
+    assert client.upload_bytes(raw, "synthetic-large.bin") == {"fid": "fixture-" + identity, "size": size}
+    del raw
+    gc.collect()
+    received = client.download_bytes("fixture-large-63m", max_bytes=size)
+    assert len(received) == size and hashlib.sha256(received).hexdigest() == identity
+    assert received[:256] == received[-256:] == pattern
+    assert limits == [("upload", 64 * 1024 * 1024), ("download", size)]
+    assert client.last_audit["report_disk_writes"] == 0 and client.last_audit["physical_writes"] == []
+    assert not (ROOT / ".ram-quark").exists()
+    print("RAM_LARGE_OBJECT_OBSERVATIONS=" + json.dumps(snapshots))
+
+
 def fake_envelope(*, ok, message=None, code=0, audit_bytes=0, data=None):
     result = {"code": code, "type": "result", "data": data or {}}
     if message is not None:
@@ -195,6 +259,81 @@ def fake_envelope(*, ok, message=None, code=0, audit_bytes=0, data=None):
     if ok:
         response["body_base64"] = base64.b64encode(b"synthetic RAM response").decode()
     return SimpleNamespace(returncode=0 if ok else 1, stdout=json.dumps(response), stderr="")
+
+
+@pytest.mark.parametrize("action", ["download", "list"])
+def test_read_deadline_retries_identical_request_and_accepts_only_the_next_valid_audit(memory_client, monkeypatch, capsys, action):
+    calls, delays = [], []
+    memory_client.last_audit = {"stale": "must-be-discarded"}
+    def run(command, **kwargs):
+        calls.append((command, json.loads(kwargs["input"])))
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(command, 180, output="sensitive-partial-base64", stderr="sensitive-private-value")
+        assert memory_client.last_audit is None
+        response = fake_envelope(ok=True)
+        if action == "list":
+            value = json.loads(response.stdout)
+            value["items"] = [{"fid": "fixture", "file_name": "cloud.bin", "size": 20}]
+            response.stdout = json.dumps(value)
+        return response
+    monkeypatch.setattr(memory_module.subprocess, "run", run)
+    monkeypatch.setattr(memory_module.time, "sleep", delays.append)
+    if action == "download":
+        assert memory_client.download_bytes("same-opaque-fid") == b"synthetic RAM response"
+        assert calls[0][1]["fid"] == "same-opaque-fid"
+    else:
+        assert memory_client.list_files("same-parent") == [{"fid": "fixture", "file_name": "cloud.bin", "size": 20, "is_dir": False}]
+        assert calls[0][1]["parent_fid"] == "same-parent"
+    assert len(calls) == 2 and calls[0] == calls[1] and delays == [1]
+    assert memory_client.last_audit["report_disk_writes"] == 0
+    assert memory_client.last_audit["physical_writes"] == []
+    assert memory_client.last_audit["transport_attempts"] == 2
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("action", ["download", "list", "upload", "mkdir"])
+def test_read_deadlines_stop_after_three_but_uncertain_writes_are_never_reissued(memory_client, monkeypatch, capsys, action):
+    calls, delays = [], []
+    memory_client.last_audit = {"report_disk_writes": 0, "physical_writes": []}
+    def run(command, **kwargs):
+        calls.append((command, json.loads(kwargs["input"])))
+        raise subprocess.TimeoutExpired(command, 180, output="sensitive-partial-base64", stderr="sensitive-private-value")
+    monkeypatch.setattr(memory_module.subprocess, "run", run)
+    monkeypatch.setattr(memory_module.time, "sleep", delays.append)
+    payload = {"fid": "same-opaque-fid"} if action == "download" else {"parent_fid": "same-parent"}
+    with pytest.raises(subprocess.TimeoutExpired):
+        memory_client._call(action, **payload)
+    maximum = 3 if action in {"download", "list"} else 1
+    assert len(calls) == maximum and all(item == calls[0] for item in calls)
+    assert delays == ([1, 2] if maximum == 3 else [])
+    assert memory_client.last_audit is None
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("invalid", ["no-audit", "physical-write", "certificate"])
+def test_a_read_deadline_does_not_relax_audit_or_certificate_validation_on_retry(memory_client, monkeypatch, invalid):
+    calls, delays = [], []
+    def run(command, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(command, 180)
+        response = fake_envelope(ok=True)
+        value = json.loads(response.stdout)
+        if invalid == "no-audit":
+            value.pop("audit")
+        elif invalid == "physical-write":
+            value["audit"]["physical_writes"] = [{"account_configuration_only": False}]
+        else:
+            response.returncode = 1
+            value["ok"] = False
+            value["result"]["msg"] = "TLS_VERIFICATION_FAILED"
+        response.stdout = json.dumps(value)
+        return response
+    monkeypatch.setattr(memory_module.subprocess, "run", run)
+    monkeypatch.setattr(memory_module.time, "sleep", delays.append)
+    with pytest.raises(CloudError):
+        memory_client.download_bytes("same-opaque-fid")
+    assert calls == [1, 1] and delays == [1]
 
 
 @pytest.mark.parametrize("message", [
@@ -451,11 +590,85 @@ def test_network_audit_records_binding_without_urls_headers_bodies_or_error_mess
     assert secret not in rendered and "fixture-user" not in rendered and "access_token=" not in rendered
 
 
-def test_network_audit_is_limited_to_twenty_entries_and_respects_agent_default_port(memory_client):
+def test_network_audit_is_bounded_and_counts_omissions_while_respecting_agent_default_port(memory_client):
     specifications = [{"transport": "https:", "options": {"hostname": "cdn.example.invalid",
-        "method": "GET", "agent": {"defaultPort": 80, "protocol": "https:"}, "path": "/not-retained"}} for _ in range(25)]
+        "method": "GET", "agent": {"defaultPort": 80, "protocol": "https:"}, "path": "/not-retained"}} for _ in range(135)]
     response = memory_client._call("contract", network_contract=specifications)
-    assert len(response["audit"]["network"]) == 20
+    assert len(response["audit"]["network"]) == 128
+    assert response["audit"]["network_omitted_count"] == 7
     assert all(item["port"] == 80 and item["transport_protocol"] == "https:" for item in response["audit"]["network"])
     assert response["contract"]["network_arguments_preserved"] is True
     assert "not-retained" not in json.dumps(response)
+
+
+def test_late_multipart_finish_timeout_crosses_real_runner_bridge_and_enters_bounded_retry(memory_client, tmp_path, monkeypatch):
+    """A real Node bridge timeout after 24 earlier requests must remain visible."""
+    runtime = Path(memory_client.config["cli_command"][-1])
+    preload = tmp_path / "synthetic-network-preload.cjs"
+    preload.write_text(r'''
+const https = require('node:https');
+const child = require('node:child_process');
+const {EventEmitter} = require('node:events');
+// No socket is opened. Nonallowlisted telemetry uses this original delegate;
+// the production bridge handles the allowlisted finish request below it.
+https.request = function () {
+  const request = new EventEmitter();
+  request.setTimeout = () => request;
+  request.write = () => true;
+  request.end = () => request;
+  request.destroy = () => request;
+  return request;
+};
+child.spawn = function () {
+  const worker = new EventEmitter();
+  worker.stdout = new EventEmitter();
+  worker.stderr = new EventEmitter();
+  worker.stdin = new EventEmitter();
+  worker.killed = false;
+  worker.kill = () => { worker.killed = true; return true; };
+  worker.stdin.end = function (_payload, done) {
+    if (typeof done === 'function') done();
+    queueMicrotask(() => worker.stderr.emit('data', Buffer.from(JSON.stringify({
+      kind:'quark-https-phase', phase:'request-started'
+    }) + '\n')));
+    // The helper deliberately never returns a response. The actual production
+    // bridge timer emits the audited timeout and destroys this synthetic child.
+  };
+  return worker;
+};
+''', encoding="utf-8")
+    runtime.write_text(r'''
+const https = require('node:https');
+const secret = 'fixture-private-network-value-do-not-record';
+for (let index = 0; index < 24; index++) {
+  https.request({hostname:'px.wpk.quark.cn',port:443,method:'POST',
+    path:'/synthetic-telemetry?token='+secret,headers:{Authorization:'Bearer '+secret}}).end(secret);
+}
+const request = https.request({hostname:'open-api-drive.quark.cn',port:443,method:'POST',
+  path:'/open/v1/file/upload_finish?access_token='+secret,
+  headers:{Authorization:'Bearer '+secret}});
+request.on('error', () => {});
+request.setTimeout(20);
+request.on('timeout', () => {
+  console.log(JSON.stringify({type:'result',code:1007,msg:
+    'Request timeout after 20ms: POST https://open-api-drive.quark.cn/open/v1/file/upload_finish?access_token='+secret}));
+  process.exit(1);
+});
+request.end(JSON.stringify({synthetic_body:secret}));
+''', encoding="utf-8")
+    memory_client.config["cli_command"] = [memory_client.config["cli_command"][0], "--require", str(preload), str(runtime)]
+    memory_client.config["cli_env"] = {"SANMOU_QUARK_MEMORY_HTTPS": "urllib", "SANMOU_QUARK_PYTHON": sys.executable}
+    delays = []
+    monkeypatch.setattr(memory_module.time, "sleep", delays.append)
+    with pytest.raises(memory_module._TransientTransportError, match="Request timeout after 20ms") as failure:
+        memory_client.upload_bytes(b"synthetic multipart payload", "same-content-addressed.gz")
+    audit = memory_client.last_audit
+    assert audit["https_adapter"] == "urllib-allowlist"
+    assert audit["transport_attempts"] == 3 and delays == [1, 2]
+    assert audit["network_omitted_count"] == 0 and len(audit["network"]) == 25
+    assert all(item["endpoint"] == "telemetry" for item in audit["network"][:24])
+    finish = audit["network"][-1]
+    assert finish["endpoint"] == "upload-finish" and finish["hostname"] == "open-api-drive.quark.cn"
+    assert {item["phase"] for item in finish["lifecycle"]} >= {"helper-spawned", "request-started", "timeout"}
+    assert audit["report_disk_writes"] == 0 and audit["physical_writes"] == []
+    assert "fixture-private-network-value-do-not-record" not in json.dumps(audit) + str(failure.value)

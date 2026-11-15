@@ -100,7 +100,7 @@ def test_failed_upload_keeps_all_local_sources_and_does_not_commit_completion(se
 def test_new_independent_verifier_detects_cloud_corruption_before_any_cleanup(setup):
     root, client, _config, store = setup
     path = source(root, "data/incoming/one.json", report())
-    client.download_hook = lambda name, raw: raw + b"corrupt" if client.list_calls >= 2 and name.startswith("memory-part-") else raw
+    client.download_hook = lambda name, raw: bytes([raw[0] ^ 1]) + raw[1:] if client.list_calls >= 2 and name.startswith("memory-part-") else raw
     with pytest.raises(CloudError, match="SHA-256"):
         migration.migrate_local(store, root, delete_after_verify=True)
     assert path.read_bytes() == report()

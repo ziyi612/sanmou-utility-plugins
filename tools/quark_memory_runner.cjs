@@ -49,7 +49,8 @@ const physicalDescriptors = new Set();
 const descriptorPaths = new Map();
 const audit = { report_disk_writes: 0, physical_writes: [], ram_write_calls: 0,
   backend: 'memfs@4.80.1 + fs-monkey@1.1.0', hash_worker: 'official in-process fallback',
-  https_adapter: pythonHttps ? 'urllib-allowlist' : 'native', network: [] };
+  https_adapter: pythonHttps ? 'urllib-allowlist' : 'native', network: [], network_omitted_count: 0 };
+const MAX_NETWORK_RECORDS = 128;
 
 const endpointCategories = new Map([
   ['/open/v1/file/get_download_url', 'download-url'],
@@ -104,8 +105,9 @@ function networkErrorCode(error) {
   return typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code) ? code : null;
 }
 function observedRequest(moduleProtocol, delegate, receiver, args) {
-  const record = audit.network.length < 20 ? describeNetwork(moduleProtocol, args) : null;
+  const record = audit.network.length < MAX_NETWORK_RECORDS ? describeNetwork(moduleProtocol, args) : null;
   if (record) audit.network.push(record);
+  else audit.network_omitted_count++;
   try {
     const request = Reflect.apply(delegate, receiver, args);
     // errorMonitor observes without consuming an otherwise unhandled error.
