@@ -117,13 +117,18 @@ def _independent_settlement(node: dict, armies: set[str]) -> bool:
 class DailyStats:
     """Bounded reads of current snapshots, their discovery links and sides."""
 
-    def __init__(self, db_path, timeout_seconds: float = 10, *, own_union_only: bool = False,
-                 runtime_dir: str | Path | None = None):
+    def __init__(self, db_path=None, timeout_seconds: float = 10, *, own_union_only: bool = False,
+                 runtime_dir: str | Path | None = None, data=None, runtime_state_provider=None):
         if not isinstance(own_union_only, bool):
             raise ValueError("own_union_only must be a boolean")
-        self.data = BattleData(db_path, timeout_seconds=timeout_seconds)
+        if data is not None and db_path is not None:
+            raise ValueError("Pass either db_path or data, not both")
+        if runtime_state_provider is not None and not callable(runtime_state_provider):
+            raise ValueError("runtime_state_provider must be callable")
+        self.data = data if data is not None else BattleData(db_path, timeout_seconds=timeout_seconds)
         self.own_union_only = own_union_only
         self.runtime_dir = Path(runtime_dir) if runtime_dir is not None else None
+        self.runtime_state_provider = runtime_state_provider
 
     def _own_unions(self, nodes: dict, sides: list[dict]) -> dict:
         """Use captured numeric identity, never list ownership or player names."""
@@ -136,14 +141,17 @@ class DailyStats:
             contexts[namespace] = context
             if match is None:
                 continue
-            if self.runtime_dir is not None:
-                folder = hashlib.sha256(namespace.encode()).hexdigest()[:20]
-                path = self.runtime_dir / folder / "collector_state.json"
+            if self.runtime_state_provider is not None or self.runtime_dir is not None:
                 try:
-                    # This is an existing local checkpoint, not a game read.
-                    if path.stat().st_size > 64 * 1024 * 1024:
-                        raise ValueError("Runtime checkpoint exceeds the read limit")
-                    state = json.loads(path.read_text(encoding="utf-8"))
+                    if self.runtime_state_provider is not None:
+                        state = self.runtime_state_provider(namespace)
+                    else:
+                        folder = hashlib.sha256(namespace.encode()).hexdigest()[:20]
+                        path = self.runtime_dir / folder / "collector_state.json"
+                        # This is an existing local checkpoint, not a game read.
+                        if path.stat().st_size > 64 * 1024 * 1024:
+                            raise ValueError("Runtime checkpoint exceeds the read limit")
+                        state = json.loads(path.read_text(encoding="utf-8"))
                     identity = state.get("runtimeIdentity", {})
                     actual = tuple(_uid(identity.get(key)) for key in ("serverId", "scenarioId", "avatarId"))
                     union = state.get("runtimeCapabilities", {}).get("unionId")
@@ -180,7 +188,7 @@ class DailyStats:
             raise ValueError("玩家筛选过长")
         started = time.monotonic()
         deadline = started + self.data.timeout_seconds
-        if not self.data.db_path.exists():
+        if not self.data.is_available():
             return self._empty(day, namespace, player_search)
         pointers = tuple(json_path_pointer(path) for path in (*META_PATHS, *SETTLEMENT_PATHS))
         params = []
@@ -440,7 +448,7 @@ class DailyStats:
         coverage["missing_parent_reports"] = len({parent for node in selected.values() for parent in node["family_ids"] if parent not in nodes})
         if time.monotonic() >= deadline:
             raise BattleQueryTimeout("每日统计超过时间预算，请按账号缩小范围。")
-        return {"available": True, "database_path": str(self.data.db_path), "day": day, "namespace": namespace,
+        return {"available": True, "database_path": self.data.database_path, "day": day, "namespace": namespace,
                 "player_search": player_search, "dates": sorted({node["date"] for node in nodes.values() if node["date"]}, reverse=True),
                 "days": sorted(days.values(), key=lambda row: row["date"], reverse=True), "players": visible_players,
                 "totals": totals, "coverage": coverage, "records": records, "warnings": warnings,
@@ -456,7 +464,7 @@ class DailyStats:
                 "note": "只统计当前最佳版本、已捕获的zgNum。已知累计不等于完整实际总额；分类可能重叠，不能相加。玩家筛选只影响玩家汇总，不改变日期战报分类。"}
 
     def _empty(self, day, namespace, player_search):
-        return {"available": False, "database_path": str(self.data.db_path), "day": day, "namespace": namespace,
+        return {"available": False, "database_path": self.data.database_path, "day": day, "namespace": namespace,
                 "player_search": player_search, "dates": [], "days": [], "players": [], "records": [], "warnings": [],
                 "union_filter": {"enabled": self.own_union_only, "contexts": {}, "excluded_reports": 0,
                                  "enemy_sides_excluded": 0, "unknown_union_sides_excluded": 0,

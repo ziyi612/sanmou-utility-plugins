@@ -5,7 +5,7 @@ Report objects, catalog entries and SQLite projections never become local files.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import sqlite3
 import threading
@@ -39,9 +39,11 @@ class CloudBattleData:
 
     memory_only = True
     allow_export = False
-    supported_pages = frozenset({"overview", "archive", "cloud", "logs"})
+    supported_pages = frozenset({"overview", "archive", "daily", "team_winrates",
+                                 "opponents", "peerless", "cloud", "logs"})
 
-    def __init__(self, store=None, *, config_path=None, max_report_bytes=64 * 1024 * 1024):
+    def __init__(self, store=None, *, config_path=None, max_report_bytes=64 * 1024 * 1024,
+                 max_projection_bytes=1024 * 1024 * 1024, stats_progress=None):
         if store is None:
             from parser.cloud_store import CloudStore
             store = CloudStore(config_path=config_path)
@@ -51,6 +53,64 @@ class CloudBattleData:
         self._ids = {}
         self._keys = {}
         self._rows = {}
+        self._stats_engine = None
+        self._stats_options = {"max_projection_bytes": max_projection_bytes, "progress": stats_progress}
+
+    def _statistics(self):
+        with self._lock:
+            if self._stats_engine is None:
+                from .cloud_stats import CloudStatsEngine
+                self._stats_engine = CloudStatsEngine(self, **self._stats_options)
+            return self._stats_engine
+
+    @property
+    def daily_service(self):
+        return self._statistics().proxy("daily")
+
+    @property
+    def team_winrate_service(self):
+        return self._statistics().proxy("team_winrates")
+
+    @property
+    def opponent_service(self):
+        return self._statistics().proxy("opponents")
+
+    @property
+    def peerless_service(self):
+        return self._statistics().proxy("peerless")
+
+    def statistics_status(self):
+        engine = self._stats_engine
+        return engine.status() if engine is not None else {"phase": "idle", "completed": 0, "total": 0,
+            "coverage": {}, "writes_local_report_files": False, "disk_cache": False}
+
+    def set_stats_progress(self, callback):
+        if callback is not None and not callable(callback):
+            raise ValueError("stats progress must be callable or None")
+        self._stats_options["progress"] = callback
+        engine = self._stats_engine
+        if engine is not None:
+            engine.progress = callback
+
+    def cancel_statistics(self):
+        engine = self._stats_engine
+        if engine is not None:
+            engine.cancel()
+
+    def close(self):
+        with self._lock:
+            self.set_stats_progress(None)
+            if self._stats_engine is not None:
+                self._stats_engine.close()
+            guard = getattr(self.store, "_lock", None)
+            with guard if hasattr(guard, "__enter__") else nullcontext():
+                if hasattr(self.store, "_cached_chunk"):
+                    self.store._cached_chunk = None
+                cached = getattr(self.store, "_compressed_cache", None)
+                if hasattr(cached, "clear"):
+                    cached.clear()
+                if hasattr(self.store, "_compressed_cache_size"):
+                    self.store._compressed_cache_size = 0
 
     @staticmethod
     def _rank(row):

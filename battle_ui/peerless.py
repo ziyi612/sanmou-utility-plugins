@@ -172,8 +172,10 @@ def _assessment_key(item):
 
 
 class PeerlessRecords:
-    def __init__(self, db_path, timeout_seconds=10):
-        self.data = BattleData(db_path, timeout_seconds=timeout_seconds)
+    def __init__(self, db_path=None, timeout_seconds=10, *, data=None):
+        if data is not None and db_path is not None:
+            raise ValueError("Pass either db_path or data, not both")
+        self.data = data if data is not None else BattleData(db_path, timeout_seconds=timeout_seconds)
 
     def summary(self, namespace=None):
         if namespace is not None and (not isinstance(namespace, str) or not namespace or len(namespace) > 500):
@@ -190,7 +192,7 @@ class PeerlessRecords:
             "rule": {"evaluator": EVALUATOR, "historical_thresholds_assumed": False,
                 "deduplication": "namespace + blockHash + continuousInfo.avatarId；无blockHash时退回战报ID",
                 "scope": "已采集的全部日期；双方真人均可，不限于对手或高品名单"}}
-        if not self.data.db_path.is_file():
+        if not self.data.is_available():
             return result
 
         def check_time():

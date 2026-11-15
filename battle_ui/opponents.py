@@ -87,8 +87,10 @@ def _tags(heroes: list[dict]) -> list[str]:
 class OpponentRoster:
     """A bounded read of current snapshots and their small relational rows."""
 
-    def __init__(self, db_path, timeout_seconds: float = 10):
-        self.data = BattleData(db_path, timeout_seconds=timeout_seconds)
+    def __init__(self, db_path=None, timeout_seconds: float = 10, *, data=None):
+        if data is not None and db_path is not None:
+            raise ValueError("Pass either db_path or data, not both")
+        self.data = data if data is not None else BattleData(db_path, timeout_seconds=timeout_seconds)
 
     @staticmethod
     def _empty(namespace):
@@ -179,7 +181,7 @@ class OpponentRoster:
         if namespace is not None and (not isinstance(namespace, str) or not namespace or len(namespace) > 500):
             raise ValueError("账号范围无效")
         result = self._empty(namespace)
-        if not self.data.db_path.exists():
+        if not self.data.is_available():
             return result
         started = time.monotonic()
         deadline = started + self.data.timeout_seconds

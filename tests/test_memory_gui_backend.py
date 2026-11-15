@@ -249,11 +249,18 @@ def scenario_actual_memory_gui(tmp_path):
             raise AssertionError("Memory Tk did not reach expected state")
 
         pump(lambda: app.metric_vars["total"].get() == "1")
-        assert app.daily_service is app.opponent_service is app.peerless_service is app.team_winrate_service is None
-        assert str(app.nav_buttons["daily"]["state"]) == "disabled"
+        for page, service, attribute in (
+                ("daily", app.daily_service, "_daily_data"),
+                ("team_winrates", app.team_winrate_service, "_team_winrate_data"),
+                ("opponents", app.opponent_service, "_roster_data"),
+                ("peerless", app.peerless_service, "_peerless_data")):
+            assert service is not None
+            assert str(app.nav_buttons[page]["state"]) == "normal"
+            app.nav_buttons[page].invoke()
+            pump(lambda name=attribute: bool(getattr(app, name).get("available")))
+            assert app._page == page
         assert app.parallel_var.get() == "1" and str(app.parallel_box["state"]) == "disabled"
-        app.show_page("daily")
-        assert app._page == "archive"
+        app.show_page("archive")
         pump(lambda: len(app._rows) == 1)
         item = next(iter(app._rows))
         app.report_tree.selection_set(item)
@@ -265,6 +272,9 @@ def scenario_actual_memory_gui(tmp_path):
         app.show_page("cloud")
         pump(lambda: app.cloud_panel.note.get().startswith("已读取云端状态。")
              and "运行内存" in app.cloud_panel.note.get())
+        cloud_text = app.cloud_panel.output.get("1.0", "end")
+        assert all(name in cloud_text for name in ("每日统计", "队伍胜率", "对手名单", "无双记录"))
+        assert "暂不提供整库统计" not in cloud_text
         app.close()
         assert controller.closed
         del app

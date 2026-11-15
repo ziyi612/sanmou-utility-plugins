@@ -144,19 +144,31 @@ def _tier(red, quality, thresholds):
 class TeamWinrateService:
     """Indexed metadata and small side/hero rows; no game reads or DB writes."""
 
-    def __init__(self, db_path, timeout_seconds=20, *, runtime_dir=None, skill_types=None):
-        self.data = BattleData(db_path, timeout_seconds=timeout_seconds)
+    def __init__(self, db_path=None, timeout_seconds=20, *, runtime_dir=None, skill_types=None,
+                 data=None, runtime_state_provider=None):
+        if data is not None and db_path is not None:
+            raise ValueError("Pass either db_path or data, not both")
+        if runtime_state_provider is not None and not callable(runtime_state_provider):
+            raise ValueError("runtime_state_provider must be callable")
+        self.data = data if data is not None else BattleData(db_path, timeout_seconds=timeout_seconds)
         self.runtime_dir = (Path(runtime_dir) if runtime_dir is not None else
-                            self.data.db_path.parent.parent / "incoming" / "runtime")
+                            self.data.db_path.parent.parent / "incoming" / "runtime"
+                            if hasattr(self.data, "db_path") else None)
         self.skill_types = skill_types
+        self.runtime_state_provider = runtime_state_provider
 
     def _match_types(self, namespace):
-        folder = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:20]
-        path = self.runtime_dir / folder / "collector_state.json"
         try:
-            if path.stat().st_size > 64 * 1024 * 1024:
+            if self.runtime_state_provider is not None:
+                state = self.runtime_state_provider(namespace)
+            elif self.runtime_dir is not None:
+                folder = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:20]
+                path = self.runtime_dir / folder / "collector_state.json"
+                if path.stat().st_size > 64 * 1024 * 1024:
+                    return {}
+                state = json.loads(path.read_text(encoding="utf-8"))
+            else:
                 return {}
-            state = json.loads(path.read_text(encoding="utf-8"))
             identity = state.get("runtimeIdentity", {})
             canonical = "server:{serverId}/scenario:{scenarioId}/avatar:{avatarId}".format(**identity)
             enums = state.get("runtimeCapabilities", {}).get("battleMatchTypes")
@@ -311,7 +323,7 @@ class TeamWinrateService:
                            "skill_type_verification": "按本地客户端Util.IsSkill的get_type=0/3/4过滤；本地配置未覆盖的新ID单列未知战法组合",
                            "deduplication": "只读当前最佳版本，同账号同战报同一侧只计一次；每档按三将ID集合一队一行，忽略排列站位",
                            "skill_variants": "战法配置按对应武将ID绑定；同主队内分别统计各配置，未知配置独立保留"}}
-        if not self.data.db_path.exists():
+        if not self.data.is_available():
             return result
         started = time.monotonic()
         deadline = started + self.data.timeout_seconds

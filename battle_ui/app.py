@@ -166,8 +166,9 @@ class _MemoryCloudPanel(tk.Frame):
                     "新战报写入本地：关闭\n本模式磁盘缓存：关闭\n"
                     "原文、目录与续采状态：保存在夸克\n"
                     "查看方式：联网读取到运行内存，关闭后释放\n\n"
-                    "已提供：档案列表、筛选、详情和事件翻页。\n"
-                    "此模式暂不提供整库统计，也不允许导出战报到本地。")
+                    "已提供：档案、每日统计、队伍胜率、对手名单、无双记录和事件翻页。\n"
+                    "首次统计需联网读取战报，当前运行期间共享内存中的统计数据。\n"
+                    "统计 CSV 可直接保存至夸克；本地战报和表格导出关闭。")
         self.output.insert("end", text)
         self.output.configure(state="disabled")
 
@@ -189,6 +190,12 @@ class BattleApp(tk.Tk):
         self.settings_path = Path(settings_path) if settings_path is not None else None
         self._preferred_time_range = time_range
         self._active_time_range_display = False
+        if self.memory_only:
+            daily_service = daily_service if daily_service is not None else getattr(data, "daily_service", None)
+            opponent_service = opponent_service if opponent_service is not None else getattr(data, "opponent_service", None)
+            peerless_service = peerless_service if peerless_service is not None else getattr(data, "peerless_service", None)
+            team_winrate_service = (team_winrate_service if team_winrate_service is not None else
+                                    getattr(data, "team_winrate_service", None))
         if daily_service is None and hasattr(data, "db_path"):
             from .daily import DailyStats
             daily_service = DailyStats(data.db_path, own_union_only=True,
@@ -213,6 +220,9 @@ class BattleApp(tk.Tk):
         self.configure(bg=BG)
         self._closed = False
         self._events: queue.Queue = queue.Queue()
+        if self.memory_only and callable(getattr(data, "set_stats_progress", None)):
+            progress_queue = self._events
+            data.set_stats_progress(lambda status: progress_queue.put(("cloud-stats-progress", 0, status, None)))
         self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="battle-ui")
         self._inflight: set[str] = set()
         self._generation: dict[str, int] = {}
@@ -353,7 +363,7 @@ class BattleApp(tk.Tk):
             self.nav_buttons[key] = button
             if self.memory_only and key not in self.data.supported_pages:
                 button.configure(state="disabled", cursor="arrow")
-        tk.Label(sidebar, text=("云端战报 · 仅运行内存\n全库统计暂不提供" if self.memory_only else "保留原有数据库\n断点续采 · 原文去重"), bg=NAVY, fg="#a4b6ca",
+        tk.Label(sidebar, text=("夸克云端战报\n档案与统计仅在内存处理" if self.memory_only else "保留原有数据库\n断点续采 · 原文去重"), bg=NAVY, fg="#a4b6ca",
                  justify="left", font=("Microsoft YaHei UI", 9), wraplength=150).pack(side="bottom", anchor="w", padx=24, pady=25)
         content = tk.Frame(shell, bg=BG)
         content.pack(side="left", fill="both", expand=True, padx=24, pady=(22, 12))
@@ -612,7 +622,7 @@ class BattleApp(tk.Tk):
         self.day_box.bind("<<ComboboxSelected>>", lambda _: self._filter_daily())
         ttk.Entry(bar, textvariable=self.player_search_var, width=20).pack(side="left", padx=10)
         ttk.Button(bar, text="筛选玩家姓名 / ID", command=self._filter_daily).pack(side="left")
-        self.daily_export_button = ttk.Button(bar, text="导出当前武勋表…", command=self.export_daily, state="disabled")
+        self.daily_export_button = ttk.Button(bar, text=("武勋表导出到夸克" if self.memory_only else "导出当前武勋表…"), command=self.export_daily, state="disabled")
         self.daily_export_button.pack(side="right")
         cards = self._small_metrics(page, [("reports", "当天归档战报", TEXT), ("players", "记录玩家", BLUE),
                                           ("merit", "已记录武勋合计", TEAL), ("unknown", "武勋字段缺失场次", AMBER)], self.daily_metrics)
@@ -645,10 +655,13 @@ class BattleApp(tk.Tk):
         self.team_battle_type_box.pack(side="left", padx=10)
         self.team_battle_type_box.bind("<<ComboboxSelected>>", self.load_team_winrates)
         ttk.Button(bar, text="重新统计", command=self.load_team_winrates).pack(side="left")
-        self.team_winrate_export_button = ttk.Menubutton(bar, text="导出 Excel / CSV…", state="disabled")
+        self.team_winrate_export_button = ttk.Menubutton(bar, text=("CSV 导出到夸克" if self.memory_only else "导出 Excel / CSV…"), state="disabled")
         self.team_winrate_export_menu = tk.Menu(self.team_winrate_export_button, tearoff=False)
         self.team_winrate_export_menu.add_command(label="Excel：全部档位的达标队伍与配置…", command=self.export_team_winrates_excel)
         self.team_winrate_export_menu.add_command(label="CSV：当前档位与当前表…", command=self.export_team_winrates)
+        if self.memory_only:
+            self.team_winrate_export_menu.entryconfigure(0, label="本地 Excel 导出在纯云端模式下关闭", state="disabled")
+            self.team_winrate_export_menu.entryconfigure(1, label="CSV：当前档位与当前表上传夸克")
         self.team_winrate_export_button.configure(menu=self.team_winrate_export_menu)
         self.team_winrate_export_button.pack(side="right")
         thresholds = tk.Frame(page, bg=BG)
@@ -726,7 +739,7 @@ class BattleApp(tk.Tk):
         bar.pack(fill="x", pady=(0, 10))
         tk.Label(bar, textvariable=self.roster_day_var, bg=BG, fg=TEXT,
                  font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        self.roster_export_button = ttk.Button(bar, text="导出最近一天名单…", command=self.export_roster, state="disabled")
+        self.roster_export_button = ttk.Button(bar, text=("名单导出到夸克" if self.memory_only else "导出最近一天名单…"), command=self.export_roster, state="disabled")
         self.roster_export_button.pack(side="right")
         self._small_metrics(page, [("players", "符合条件的对手", TEXT), ("teams", "观察到的队伍", BLUE),
                                   ("full", "含满红武将的对手", TEAL)], self.roster_metrics).pack(fill="x", pady=(0, 10))
@@ -771,7 +784,7 @@ class BattleApp(tk.Tk):
         self.peerless_day_box.bind("<<ComboboxSelected>>", self._filter_peerless)
         ttk.Entry(bar, textvariable=self.peerless_search_var, width=19).pack(side="left", padx=10)
         ttk.Button(bar, text="筛选玩家姓名 / ID", command=self._filter_peerless).pack(side="left")
-        self.peerless_export_button = ttk.Button(bar, text="导出当前无双记录…", command=self.export_peerless,
+        self.peerless_export_button = ttk.Button(bar, text=("无双记录导出到夸克" if self.memory_only else "导出当前无双记录…"), command=self.export_peerless,
                                                  state="disabled")
         self.peerless_export_button.pack(side="right")
         self._small_metrics(page, [("occurrences", "无双记录", TEAL), ("players", "当事玩家", BLUE),
@@ -859,6 +872,9 @@ class BattleApp(tk.Tk):
                 key, generation, result, error = self._events.get_nowait()
             except queue.Empty:
                 break
+            if key == "cloud-stats-progress":
+                self._render_stats_progress(result)
+                continue
             callback = self._callbacks.pop((key, generation), None)
             if self._active_generations.get(key) == generation:
                 self._active_generations.pop(key, None)
@@ -886,6 +902,27 @@ class BattleApp(tk.Tk):
             self._next_overview = time.monotonic() + (60 if self.memory_only else 15)
             self._submit("overview", self.data.overview, self._render_overview)
         self._poll_id = self.after(500, self._poll)
+
+    def _render_stats_progress(self, status):
+        if self._page not in {"daily", "team_winrates", "opponents", "peerless"}:
+            return
+        phase = status.get("phase")
+        completed, total = status.get("completed", 0), status.get("total", 0)
+        if phase in {"ready", "closed", "idle"}:
+            return
+        if phase == "reports":
+            text = (f"正在从夸克读取统计所需战报：{completed:,}/{total:,}。"
+                    "首次读取可能较慢，结果仅在本次运行内存中保留，其他三项统计共享已读取的数据。")
+        elif phase in {"metadata", "metadata_recovery"}:
+            text = "正在从夸克核对同盟、战斗类型和无双判定依据；本机不写入战报文件。"
+        elif phase == "query":
+            text = "云端战报已读取，正在内存中汇总统计结果……"
+        else:
+            text = "正在核对夸克目录并准备内存统计；首次读取可能较慢。"
+        self._message(text)
+        variable = {"daily": self.daily_note_var, "team_winrates": self.team_winrate_note_var,
+                    "opponents": self.roster_note_var, "peerless": self.peerless_note_var}[self._page]
+        variable.set(text)
 
     @staticmethod
     def _read_runtime(controller):
@@ -975,7 +1012,7 @@ class BattleApp(tk.Tk):
 
     def show_page(self, page, *, load=True):
         if self.memory_only and page not in self.data.supported_pages:
-            self._message("严格云端模式提供档案、筛选及详情；跨全历史统计暂不提供。")
+            self._message("此页面不在当前云端数据源的支持范围内。")
             page = "archive"
         self._page = page
         self.pages[page].tkraise()
@@ -990,6 +1027,10 @@ class BattleApp(tk.Tk):
         if self.memory_only:
             names.update(overview=("云端采集总览", "战报自动上传夸克；本机仅在运行内存中处理，断网时无法读取新内容。"),
                          archive=("云端战报档案", "联网读取云端目录和所选原文；不保存本地数据库、缓存或导出。"),
+                         daily=("每日统计", "从夸克读取并在内存汇总我盟实际记载的武勋；同盟身份未确认时明确提示。"),
+                         team_winrates=("队伍胜率", "在内存统计双方队伍与战法表现；首次读取较慢，结果仅在本次运行中保留。"),
+                         opponents=("对手名单", "联网读取最近有战报的一天；名单只代表战报中的观察，不代表实时阵容。"),
+                         peerless=("无双记录", "仅收录有游戏判定依据的无双，支持跳转云端原战报；缺失信息保持未核实。"),
                          cloud=("夸克云端", "原文和目录保存在夸克；每次读取校验后仅进入运行内存。"),
                          logs=("运行记录", "状态和诊断仅保存在当前窗口内存，关闭后释放。"))
         self.title_var.set(names[page][0])
@@ -1365,6 +1406,9 @@ class BattleApp(tk.Tk):
         return dict(options)
 
     def export_team_winrates_excel(self):
+        if self.memory_only:
+            self._message("纯云端模式请使用 CSV 导出到夸克，统计不会保存为本地文件。")
+            return
         options = self._checked_team_winrate_export_options()
         if not options or not hasattr(self.data, "db_path"):
             return
@@ -1582,7 +1626,16 @@ class BattleApp(tk.Tk):
         self._set_text(self.opponent_text, "\n".join(lines))
 
     def _export_csv(self, title, filename, headers, rows):
-        if not rows or not hasattr(self.data, "db_path"):
+        if not rows:
+            return
+        if self.memory_only:
+            from .cloud_exports import export_csv_to_quark
+            store, copied = self.data.store, [list(row) for row in rows]
+            self._message("正在将统计表从运行内存上传夸克并校验；不创建本地文件……")
+            self._submit("csv-export", lambda: export_csv_to_quark(store, filename, list(headers), copied),
+                         lambda result: self._message(f"已上传夸克并校验：{result['name']}；本机未保存文件。"))
+            return
+        if not hasattr(self.data, "db_path"):
             return
         folder = self.root_path / "output" / "exports"
         folder.mkdir(parents=True, exist_ok=True)
@@ -2011,11 +2064,15 @@ class BattleApp(tk.Tk):
             self.after_cancel(self._poll_id)
         self.after_cancel(self._initial_refresh_id)
         self._pending_operations.clear()
+        if getattr(self, "memory_only", False) and callable(getattr(self.data, "cancel_statistics", None)):
+            self.data.cancel_statistics()
         self._executor.shutdown(wait=True, cancel_futures=True)
         self._callbacks.clear()
         self._active_generations.clear()
         self._futures.clear()
         self.controller.close()
+        if getattr(self, "memory_only", False) and callable(getattr(self.data, "close", None)):
+            self.data.close()
         self.destroy()
         for values in (self.pages, self.nav_buttons, self.component_labels, self.metric_vars, self.scopes,
                        self.daily_metrics, self.roster_metrics, self.peerless_metrics,

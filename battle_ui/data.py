@@ -1,12 +1,14 @@
 """Bounded, read-only queries for the desktop battle archive browser.
 
-Connections are local to one method call, so the GUI can run every operation on
-its worker thread.  In particular this module never scans the recursive field
-projection or loads a full snapshot just to draw a list or a detail panel.
+File connections are local to one method call; injected memory connections are
+borrowed for one read transaction and serialized by the caller. This module
+never scans the recursive field projection or loads a full snapshot just to
+draw a list or a detail panel.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -61,25 +63,81 @@ def _json_preview(value: str | None, maximum: int = _MAX_JSON_CHARS) -> Any:
 class BattleData:
     """Small current-report queries; no schema migrations and no write API."""
 
-    def __init__(self, db_path: str | Path, timeout_seconds: float = 5.0):
+    def __init__(self, db_path: str | Path | None = None, timeout_seconds: float = 5.0,
+                 *, connection: sqlite3.Connection | None = None):
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (float, int)) \
                 or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 60:
             raise ValueError("timeout_seconds must be finite and between 0 and 60")
-        self.db_path = Path(db_path).expanduser().resolve()
         self.timeout_seconds = float(timeout_seconds)
+        self.memory_only = connection is not None
+        self._memory_connection = connection
+        if self.memory_only:
+            if db_path is not None:
+                raise ValueError("Pass either db_path or an in-memory connection, not both")
+            self._validate_memory(connection)
+            connection.execute("PRAGMA temp_store=MEMORY")
+        else:
+            if db_path is None:
+                raise ValueError("db_path or an in-memory connection is required")
+            self.db_path = Path(db_path).expanduser().resolve()
+
+    @staticmethod
+    def _validate_memory(connection):
+        if not isinstance(connection, sqlite3.Connection):
+            raise ValueError("connection must be an in-memory SQLite connection")
+        databases = list(connection.execute("PRAGMA database_list"))
+        if not databases or any(row[2] for row in databases):
+            raise ValueError("The query connection must be entirely in memory")
+        for _sequence, name, _filename in databases:
+            quoted = '"' + name.replace('"', '""') + '"'
+            if connection.execute(f"PRAGMA {quoted}.journal_mode").fetchone()[0] != "memory":
+                raise ValueError("The query connection must use in-memory databases")
+
+    @property
+    def database_path(self) -> str | None:
+        return None if self.memory_only else str(self.db_path)
+
+    def is_available(self) -> bool:
+        if self.memory_only:
+            return True
+        return self.db_path.is_file()
+
+    @staticmethod
+    def _memory_read_authorizer(action, first, second, _database, _trigger):
+        if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
+            return sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_PRAGMA and second is not None \
+                and first.casefold() not in {"table_info", "table_xinfo", "index_info", "index_xinfo", "index_list", "foreign_key_list"}:
+            return sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_FUNCTION and str(second).casefold() == "load_extension":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
 
     @contextmanager
     def _connection(self):
-        if not self.db_path.is_file():
-            raise BattleDataError(f"数据库尚未创建或文件不可用：{self.db_path}")
+        if not self.is_available():
+            raise BattleDataError(f"数据库尚未创建或文件不可用：{self.database_path}")
         connection = None
+        previous_query_only = None
+        previous_row_factory = None
+        transaction_started = False
         deadline = time.monotonic() + self.timeout_seconds
         try:
-            connection = sqlite3.connect(self.db_path.as_uri() + "?mode=ro", uri=True, timeout=.5)
+            if self.memory_only:
+                connection = self._memory_connection
+                self._validate_memory(connection)
+                if connection.in_transaction:
+                    raise BattleDataError("内存统计连接仍有未完成的操作，请稍后刷新。")
+                previous_row_factory = connection.row_factory
+                previous_query_only = connection.execute("PRAGMA query_only").fetchone()[0]
+            else:
+                connection = sqlite3.connect(self.db_path.as_uri() + "?mode=ro", uri=True, timeout=.5)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout=500")
             connection.execute("PRAGMA temp_store=MEMORY")
             connection.execute("PRAGMA query_only=ON")
+            if self.memory_only:
+                connection.set_authorizer(self._memory_read_authorizer)
             connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             actual = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
@@ -92,6 +150,7 @@ class BattleData:
             # Keep each browser operation internally consistent while the
             # independent collector commits new snapshots in WAL mode.
             connection.execute("BEGIN")
+            transaction_started = True
             yield connection
         except sqlite3.OperationalError as exc:
             if "interrupted" in str(exc).lower() or time.monotonic() >= deadline:
@@ -101,7 +160,15 @@ class BattleData:
             raise BattleDataError(f"数据库读取失败：{exc}") from exc
         finally:
             if connection is not None:
-                connection.close()
+                if self.memory_only and previous_query_only is not None:
+                    connection.set_progress_handler(None, 0)
+                    connection.set_authorizer(None)
+                    if transaction_started:
+                        connection.rollback()
+                    connection.execute(f"PRAGMA query_only={int(previous_query_only)}")
+                    connection.row_factory = previous_row_factory
+                elif not self.memory_only:
+                    connection.close()
 
     @staticmethod
     def _semantics(connection: sqlite3.Connection, snapshot_id: int) -> dict:
@@ -152,9 +219,9 @@ class BattleData:
         report["result_verified"] = False  # No undocumented enum-to-win/lose guess.
 
     def overview(self) -> dict:
-        base = {"available": False, "database_path": str(self.db_path), "total": 0,
+        base = {"available": False, "database_path": self.database_path, "total": 0,
                 "complete": 0, "partial": 0, "legacy": 0, "events": 0, "accounts": []}
-        if not self.db_path.exists():
+        if not self.is_available():
             base["note"] = "数据库尚未创建，启动采集后会自动显示已保存战报。"
             return base
         with self._connection() as connection:
@@ -369,21 +436,29 @@ class BattleData:
         from parser.report_archive import ReportArchive
         # A cache miss may download an original. Do it outside the UI's fixed
         # SQLite read transaction and keep the existing bounded preview size.
-        with ReportArchive(self.db_path, read_only=True) as archive:
-            raw = archive.original_bytes(snapshot_id)
+        if not self.memory_only:
+            with ReportArchive(self.db_path, read_only=True) as archive:
+                raw = archive.original_bytes(snapshot_id)
         with self._connection() as connection:
+            columns = "f.byte_count,f.sha256" + (",f.raw_bytes" if self.memory_only else "")
             row = connection.execute(
-                "SELECT f.byte_count,f.sha256,substr(f.raw_bytes,1,?) preview "
+                f"SELECT {columns} "
                 "FROM report_snapshots s JOIN report_files f ON f.id=s.file_id WHERE s.id=?",
-                (max_bytes + 1, snapshot_id)).fetchone()
+                (snapshot_id,)).fetchone()
             if row is None:
                 raise KeyError(snapshot_id)
+            if self.memory_only:
+                raw = bytes(row["raw_bytes"])
+                if len(raw) != row["byte_count"] or hashlib.sha256(raw).hexdigest() != row["sha256"]:
+                    raise BattleDataError("内存中的战报原文校验失败，请重新读取云端战报。")
             return {"text": raw[:max_bytes].decode("utf-8-sig", "replace"),
                     "bytes": row["byte_count"], "sha256": row["sha256"],
                     "truncated": row["byte_count"] > max_bytes,
                     "note": "仅缩短界面预览；导出原文可获得完整字节。"}
 
     def export_original(self, snapshot_id: int, path: str | Path) -> dict:
+        if self.memory_only:
+            raise BattleDataError("纯内存模式不允许将战报导出到本地文件。")
         snapshot_id = _integer(snapshot_id, "snapshot_id", 1, 2**63 - 1)
         from parser.report_archive import ReportArchive
         with ReportArchive(self.db_path, read_only=True) as archive:
